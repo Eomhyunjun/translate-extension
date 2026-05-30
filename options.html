@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Translator Settings</title>
+    <link rel="stylesheet" href="src/options.css" />
+  </head>
+  <body>
+    <main class="settings">
+      <header>
+        <h1>상세 설정</h1>
+        <p>API 키는 로컬 저장소에만 저장됩니다. 사용 로그에는 번역 요청 텍스트 미리보기와 추정 토큰 수가 포함됩니다.</p>
+      </header>
+
+      <nav class="tabs" aria-label="상세 설정 탭">
+        <button id="keysTab" class="tab active" type="button">API 키</button>
+        <button id="logsTab" class="tab" type="button">사용 로그</button>
+      </nav>
+
+      <section id="keysPanel">
+        <h2>API 키</h2>
+        <label class="field">
+          <span>Microsoft Translator</span>
+          <input id="microsoftApiKey" type="password" autocomplete="off" placeholder="Azure Translator key" />
+        </label>
+        <label class="field">
+          <span>Zhipu BigModel</span>
+          <input id="zhipuApiKey" type="password" autocomplete="off" placeholder="Zhipu API key" />
+        </label>
+        <label class="field">
+          <span>GPT / OpenAI</span>
+          <input id="gptApiKey" type="password" autocomplete="off" placeholder="OpenAI API key" />
+        </label>
+        <label class="field">
+          <span>Gemini</span>
+          <input id="geminiApiKey" type="password" autocomplete="off" placeholder="Google AI Studio API key" />
+        </label>
+        <label class="field">
+          <span>Claude</span>
+          <input id="claudeApiKey" type="password" autocomplete="off" placeholder="Anthropic API key" />
+        </label>
+        <label class="field">
+          <span>OpenAI-compatible</span>
+          <input id="openaiApiKey" type="password" autocomplete="off" placeholder="Provider API key" />
+        </label>
+
+        <div class="actions">
+          <button id="saveBtn" class="primary" type="button">저장</button>
+          <button id="resetBtn" type="button">키 삭제</button>
+        </div>
+      </section>
+
+      <section id="logsPanel" hidden>
+        <div class="section-heading">
+          <div>
+            <h2>사용 로그</h2>
+        <p>로그 저장은 기본 꺼짐입니다. 켜면 최대 100개 요청 배치를 로컬에 보관하고 입력/출력 텍스트 미리보기와 실제 또는 추정 토큰 수를 표시합니다.</p>
+          </div>
+          <button id="clearLogsBtn" type="button">로그 삭제</button>
+        </div>
+
+        <label class="check">
+          <input id="keepTextLogs" type="checkbox" />
+          <span>입력/출력 텍스트 미리보기와 사용량 로그 저장</span>
+        </label>
+
+        <div id="logSummary" class="summary"></div>
+        <div id="logsList" class="logs-list"></div>
+      </section>
+
+      <p id="message" class="message" role="status"></p>
+    </main>
+    <script src="src/options.js"></script>
+  </body>
+</html>

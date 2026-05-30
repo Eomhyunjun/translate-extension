@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Bilingual Translator</title>
+    <link rel="stylesheet" href="src/popup.css" />
+  </head>
+  <body>
+    <main class="popup">
+      <header>
+        <div>
+          <h1>Translator</h1>
+          <p>현재 페이지를 문단 단위로 번역합니다.</p>
+        </div>
+        <span id="statusDot" class="dot" title="상태"></span>
+      </header>
+
+      <label class="field">
+        <span>번역 엔진</span>
+        <select id="provider">
+          <option value="google">Google Translate</option>
+          <option value="microsoft">Microsoft Translator</option>
+          <option value="zhipu">Zhipu BigModel</option>
+          <option value="gpt">GPT / OpenAI</option>
+          <option value="gemini">Gemini</option>
+          <option value="claude">Claude</option>
+          <option value="mymemory">MyMemory 무료 API</option>
+          <option value="openai">OpenAI-compatible API</option>
+        </select>
+      </label>
+
+      <section id="providerFields" class="provider-fields" hidden>
+        <label id="microsoftRegionField" class="field provider-field" data-provider-field="microsoft">
+          <span>Microsoft region</span>
+          <input id="microsoftRegion" type="text" placeholder="koreacentral, eastus..." />
+        </label>
+
+        <label id="zhipuModelField" class="field provider-field" data-provider-field="zhipu">
+          <span>Zhipu model</span>
+          <select id="zhipuModel">
+            <option value="glm-4-flash">glm-4-flash</option>
+            <option value="glm-4-air">glm-4-air</option>
+            <option value="glm-4-plus">glm-4-plus</option>
+          </select>
+        </label>
+
+        <label id="gptModelField" class="field provider-field" data-provider-field="gpt">
+          <span>GPT model</span>
+          <select id="gptModel">
+            <option value="gpt-4.1-mini">gpt-4.1-mini</option>
+            <option value="gpt-4.1">gpt-4.1</option>
+            <option value="gpt-4o-mini">gpt-4o-mini</option>
+            <option value="gpt-4o">gpt-4o</option>
+          </select>
+        </label>
+
+        <label id="geminiModelField" class="field provider-field" data-provider-field="gemini">
+          <span>Gemini model</span>
+          <select id="geminiModel">
+            <option value="gemini-2.0-flash">gemini-2.0-flash</option>
+            <option value="gemini-1.5-flash">gemini-1.5-flash</option>
+            <option value="gemini-1.5-pro">gemini-1.5-pro</option>
+          </select>
+        </label>
+
+        <label id="claudeModelField" class="field provider-field" data-provider-field="claude">
+          <span>Claude model</span>
+          <select id="claudeModel">
+            <option value="claude-3-5-haiku-latest">claude-3-5-haiku-latest</option>
+            <option value="claude-3-5-sonnet-latest">claude-3-5-sonnet-latest</option>
+            <option value="claude-3-7-sonnet-latest">claude-3-7-sonnet-latest</option>
+          </select>
+        </label>
+
+        <label id="openaiEndpointField" class="field provider-field" data-provider-field="openai">
+          <span>Compatible endpoint</span>
+          <input id="openaiEndpoint" type="url" placeholder="https://api.example.com/v1/chat/completions" />
+        </label>
+
+        <label id="openaiModelField" class="field provider-field" data-provider-field="openai">
+          <span>Compatible model</span>
+          <input id="openaiModel" type="text" placeholder="provider-specific model" />
+        </label>
+      </section>
+
+      <label class="field">
+        <span>원문 언어</span>
+        <select id="sourceLang">
+          <option value="en">English</option>
+          <option value="auto">자동 감지</option>
+          <option value="ko">한국어</option>
+          <option value="ja">日本語</option>
+          <option value="zh-CN">简体中文</option>
+          <option value="zh-TW">繁體中文</option>
+          <option value="es">Español</option>
+          <option value="fr">Français</option>
+          <option value="de">Deutsch</option>
+        </select>
+      </label>
+
+      <label class="field">
+        <span>번역 언어</span>
+        <select id="targetLang">
+          <option value="ko">한국어</option>
+          <option value="en">English</option>
+          <option value="ja">日本語</option>
+          <option value="zh-CN">简体中文</option>
+          <option value="zh-TW">繁體中文</option>
+          <option value="es">Español</option>
+          <option value="fr">Français</option>
+          <option value="de">Deutsch</option>
+        </select>
+      </label>
+
+      <label class="field">
+        <span>보기 모드</span>
+        <select id="viewMode">
+          <option value="inline">인라인</option>
+          <option value="split">분할 보기</option>
+        </select>
+      </label>
+
+      <label id="displayModeField" class="field">
+        <span>인라인 표시 방식</span>
+        <select id="displayMode">
+          <option value="below">원문 아래</option>
+          <option value="replace">번역문만</option>
+        </select>
+      </label>
+
+      <label id="translateScopeField" class="field">
+        <span>번역 범위</span>
+        <select id="translateScope">
+          <option value="viewport">현재 보이는 화면만</option>
+          <option value="page">전체 페이지</option>
+        </select>
+      </label>
+
+      <label class="check">
+        <input id="skipTranslated" type="checkbox" />
+        <span>이미 한국어가 많은 문단 건너뛰기</span>
+      </label>
+
+      <label class="field">
+        <span class="label-row">
+          한 번에 번역할 문단 수
+          <button
+            id="batchHelpBtn"
+            class="info-button"
+            type="button"
+            aria-label="한 번에 번역할 문단 수 설명"
+            aria-expanded="false"
+          >!</button>
+        </span>
+        <input id="batchSize" type="number" min="1" max="20" step="1" />
+      </label>
+
+      <p id="batchHelp" class="help-popover" hidden>
+        페이지에서 찾은 문단을 API에 몇 개씩 묶어서 보낼지 정합니다. 숫자가 크면 빠를 수 있지만 실패 가능성이 올라가고, 작으면 느리지만 안정적입니다.
+      </p>
+
+      <div class="actions">
+        <button id="translateBtn" class="primary" type="button">적용</button>
+        <button id="clearBtn" type="button">비적용</button>
+      </div>
+
+      <button id="optionsBtn" class="link" type="button">API 키 설정</button>
+      <p id="message" class="message" role="status"></p>
+    </main>
+    <script src="src/popup.js"></script>
+  </body>
+</html>
