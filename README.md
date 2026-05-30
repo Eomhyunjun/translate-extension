@@ -9,10 +9,11 @@ Immersive Translate style browser extension prototype. It translates readable pa
 - Split translation mode: opens the same URL in a paired window and translates that copy in-place
 - Scroll synchronization between the original and translated split windows
 - Popup controls for provider, model, language, display mode, skip behavior, and paragraph batch size
-- Clear translated text from the current page
+- Remove translated text from the current page and clear split-view sessions
 - Google Translate provider by default
 - Microsoft Translator, Zhipu BigModel, GPT/OpenAI, Gemini, Claude, MyMemory, and OpenAI-compatible providers
 - API keys stored in `chrome.storage.local`, not synced across browser profiles
+- Optional usage logs stored locally, disabled by default
 
 ## Install locally
 
@@ -24,7 +25,7 @@ Immersive Translate style browser extension prototype. It translates readable pa
 
 ## Provider setup
 
-The default Google provider uses a public web endpoint and requires no key, but it is best treated as a prototype/testing path. It defaults to English source text; change the source language in options when translating other languages.
+The default Google provider uses a public web endpoint and requires no key, but it is best treated as a prototype/testing path. It defaults to English source text; change the source language in the popup when translating other languages.
 
 Microsoft Translator, Zhipu BigModel, GPT/OpenAI, Gemini, and Claude may have free quotas or free-tier credits depending on the provider, but they still require provider accounts and API keys.
 
@@ -34,6 +35,7 @@ Microsoft Translator, Zhipu BigModel, GPT/OpenAI, Gemini, and Claude may have fr
 - Gemini: choose `Gemini`, then set your Google AI Studio API key and model.
 - Claude: choose `Claude`, then set your Anthropic API key and model.
 - MyMemory: choose `MyMemory 무료 API`; no key is required, but public limits are low.
+- OpenAI-compatible: choose `OpenAI-compatible`, then set the provider API key, model, and an HTTPS endpoint ending in `/chat/completions`.
 
 ## API key privacy
 
@@ -43,11 +45,18 @@ Browser extensions cannot make user-provided API keys impossible to inspect on t
 
 For better quality, choose a provider and model from the extension popup. Add API keys from the options page.
 
-- Endpoint: `https://api.openai.com/v1/chat/completions`
-- API key: your API key
-- Model: for example `gpt-4o-mini`
+## OpenAI-compatible endpoints
 
-Any provider that supports OpenAI-compatible chat completions should work if it returns normal `choices[0].message.content`.
+Any provider that supports OpenAI-compatible chat completions should work if it returns normal `choices[0].message.content`. The endpoint must be an HTTPS URL without embedded credentials, and the path must end with `/chat/completions`. Non-OpenAI hosts request optional host permission when you save them.
+
+Defaults:
+
+- Endpoint: `https://api.openai.com/v1/chat/completions`
+- Model: `gpt-4o-mini`
+
+## Usage logs
+
+Usage logging is off by default. When enabled in the options page, the extension stores up to 100 request batches in `chrome.storage.local`, including input/output text previews, status, duration, and actual or estimated token counts.
 
 ## Notes
 

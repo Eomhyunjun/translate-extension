@@ -1,25 +1,7 @@
-const DEFAULT_SETTINGS = {
-  provider: "google",
-  targetLang: "ko",
-  sourceLang: "en",
-  viewMode: "inline",
-  displayMode: "below",
-  translateScope: "viewport",
-  skipTranslated: true,
-  keepTextLogs: false,
-  batchSize: 6,
-  openaiEndpoint: "https://api.openai.com/v1/chat/completions",
-  openaiModel: "gpt-4o-mini",
-  microsoftRegion: "",
-  zhipuEndpoint: "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-  zhipuModel: "glm-4-flash",
-  gptEndpoint: "https://api.openai.com/v1/chat/completions",
-  gptModel: "gpt-4.1-mini",
-  geminiEndpoint: "https://generativelanguage.googleapis.com/v1beta",
-  geminiModel: "gemini-2.0-flash",
-  claudeEndpoint: "https://api.anthropic.com/v1/messages",
-  claudeModel: "claude-3-5-haiku-latest"
-};
+importScripts("defaults.js");
+
+const DEFAULT_SETTINGS = globalThis.BIT_DEFAULT_SETTINGS;
+const SECRET_DEFAULTS = globalThis.BIT_SECRET_DEFAULTS;
 
 let logWriteQueue = Promise.resolve();
 const SPLIT_SESSIONS_STORAGE_KEY = "splitSessions";
@@ -28,15 +10,104 @@ const SPLIT_SCROLL_LOOSE_ECHO_WINDOW_MS = 180;
 const splitSessionsByTab = new Map();
 const pendingSplitTargets = new Map();
 let splitSessionsReady = null;
+let secretsMigrationReady = null;
 
-const SECRET_DEFAULTS = {
-  openaiApiKey: "",
-  microsoftApiKey: "",
-  zhipuApiKey: "",
-  gptApiKey: "",
-  geminiApiKey: "",
-  claudeApiKey: ""
+const MESSAGE_TYPES = {
+  START_SPLIT_MODE: "START_SPLIT_MODE",
+  CLEAR_SPLIT_SESSION: "CLEAR_SPLIT_SESSION",
+  SPLIT_SCROLL: "SPLIT_SCROLL",
+  TRANSLATE_BATCH: "TRANSLATE_BATCH"
 };
+
+const RUNTIME_MESSAGE_HANDLERS = {
+  [MESSAGE_TYPES.START_SPLIT_MODE]: startSplitMode,
+  [MESSAGE_TYPES.CLEAR_SPLIT_SESSION]: handleClearSplitSessionMessage,
+  [MESSAGE_TYPES.SPLIT_SCROLL]: relaySplitScroll,
+  [MESSAGE_TYPES.TRANSLATE_BATCH]: handleTranslateBatchMessage
+};
+
+const ALLOWED_PROVIDERS = new Set(["google", "microsoft", "zhipu", "gpt", "gemini", "claude", "openai", "mymemory"]);
+const ALLOWED_LANGS = new Set(["auto", "ko", "en", "ja", "zh-CN", "zh-TW", "es", "fr", "de"]);
+const ALLOWED_MODELS = {
+  zhipuModel: new Set(["glm-4-flash", "glm-4-air", "glm-4-plus"]),
+  gptModel: new Set(["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini", "gpt-4o"]),
+  geminiModel: new Set(["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]),
+  claudeModel: new Set(["claude-3-5-haiku-latest", "claude-3-5-sonnet-latest", "claude-3-7-sonnet-latest"])
+};
+const ALLOWED_SPLIT_VIEW_MODES = new Set(["inline", "split"]);
+const ALLOWED_SPLIT_DISPLAY_MODES = new Set(["below", "replace"]);
+const ALLOWED_SPLIT_SCOPES = new Set(["viewport", "page"]);
+
+const OPENAI_COMPATIBLE_PROVIDER_CONFIG = {
+  zhipu: {
+    endpointKey: "zhipuEndpoint",
+    apiKeyKey: "zhipuApiKey",
+    modelKey: "zhipuModel",
+    providerLabel: "Zhipu BigModel"
+  },
+  gpt: {
+    endpointKey: "gptEndpoint",
+    apiKeyKey: "gptApiKey",
+    modelKey: "gptModel",
+    providerLabel: "GPT / OpenAI"
+  },
+  openai: {
+    providerLabel: "OpenAI-compatible"
+  }
+};
+
+const PROVIDER_MODEL_KEYS = {
+  zhipu: "zhipuModel",
+  gpt: "gptModel",
+  gemini: "geminiModel",
+  claude: "claudeModel",
+  openai: "openaiModel"
+};
+
+const PROVIDER_MODEL_LABELS = {
+  microsoft: "Microsoft Translator",
+  google: "Google Translate",
+  mymemory: "MyMemory"
+};
+
+const TRANSLATION_JSON_ARRAY_INSTRUCTION =
+  "Translate each input string faithfully. Preserve meaning, names, numbers, punctuation, and inline whitespace. Return only a JSON array of translated strings.";
+const CLAUDE_SYSTEM_INSTRUCTION =
+  "Translate faithfully. Preserve meaning, names, numbers, punctuation, and inline whitespace. Return only a JSON array of translated strings.";
+
+const SPLIT_SCROLL_SIGNATURE_KEYS = [
+  "blockId",
+  "scrollX",
+  "scrollY",
+  "pageXOffset",
+  "pageYOffset",
+  "scrollLeft",
+  "scrollTop",
+  "left",
+  "top",
+  "x",
+  "y",
+  "ratio",
+  "xRatio",
+  "scrollRatio",
+  "progress",
+  "percent"
+];
+
+const SPLIT_SCROLL_VOLATILE_KEYS = new Set([
+  "type",
+  "tabId",
+  "sourceTabId",
+  "targetTabId",
+  "fromTabId",
+  "toTabId",
+  "originTabId",
+  "relayId",
+  "relayed",
+  "_splitRelay",
+  "timestamp",
+  "ts"
+]);
 
 chrome.runtime.onInstalled.addListener(async () => {
   const stored = await chrome.storage.sync.get(Object.keys(DEFAULT_SETTINGS));
@@ -49,36 +120,7 @@ chrome.runtime.onStartup.addListener(() => {
   migrateSecretsToLocal();
 });
 
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message?.type === "START_SPLIT_MODE") {
-    startSplitMode(message, sender)
-      .then((result) => sendResponse({ ok: true, ...result }))
-      .catch((error) => sendResponse({ ok: false, error: sanitizeError(error) }));
-    return true;
-  }
-
-  if (message?.type === "CLEAR_SPLIT_SESSION") {
-    clearSplitSession(message.tabId)
-      .then((result) => sendResponse({ ok: true, ...result }))
-      .catch((error) => sendResponse({ ok: false, error: sanitizeError(error) }));
-    return true;
-  }
-
-  if (message?.type === "SPLIT_SCROLL") {
-    relaySplitScroll(message, sender)
-      .then((result) => sendResponse({ ok: true, ...result }))
-      .catch((error) => sendResponse({ ok: false, error: sanitizeError(error) }));
-    return true;
-  }
-
-  if (message?.type !== "TRANSLATE_BATCH") return false;
-
-  translateBatch(normalizeTexts(message.texts), sanitizeOptions(message.options))
-    .then((translations) => sendResponse({ ok: true, translations }))
-    .catch((error) => sendResponse({ ok: false, error: sanitizeError(error) }));
-
-  return true;
-});
+chrome.runtime.onMessage.addListener(routeRuntimeMessage);
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status !== "complete") return;
@@ -89,51 +131,111 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   handleSplitTabRemoved(tabId).catch(() => {});
 });
 
+function routeRuntimeMessage(message, sender, sendResponse) {
+  const handler = RUNTIME_MESSAGE_HANDLERS[message?.type];
+  if (!handler) return false;
+
+  try {
+    respondToRuntimeMessage(handler(message, sender), sendResponse);
+  } catch (error) {
+    sendResponse({ ok: false, error: sanitizeError(error) });
+  }
+  return true;
+}
+
+function respondToRuntimeMessage(resultPromise, sendResponse) {
+  Promise.resolve(resultPromise)
+    .then((result) => {
+      const payload = isPlainObject(result) ? result : {};
+      sendResponse({ ok: true, ...payload });
+    })
+    .catch((error) => sendResponse({ ok: false, error: sanitizeError(error) }));
+}
+
+function handleClearSplitSessionMessage(message) {
+  return clearSplitSession(message.tabId);
+}
+
+async function handleTranslateBatchMessage(message) {
+  const translations = await translateBatch(normalizeTexts(message.texts), sanitizeOptions(message.options));
+  return { translations };
+}
+
 async function startSplitMode(message, sender) {
-  const normalizedSourceTabId = normalizeTabId(message.sourceTabId ?? message.tabId ?? sender?.tab?.id);
-  if (!Number.isInteger(normalizedSourceTabId)) throw new Error("Source tab is missing.");
+  const sourceTabId = getSplitSourceTabId(message, sender);
+  if (!Number.isInteger(sourceTabId)) throw new Error("Source tab is missing.");
 
   await ensureSplitSessionsLoaded();
-  await clearSplitSession(normalizedSourceTabId);
+  await clearSplitSession(sourceTabId);
 
-  const sourceTab = await chrome.tabs.get(normalizedSourceTabId);
+  const sourceTab = await getSupportedSplitSourceTab(sourceTabId);
+  const rawOptions = getSplitRawOptions(message);
+  const splitOptions = sanitizeSplitOptions(rawOptions);
+  const targetTab = await createSplitTargetTab(sourceTab, rawOptions);
+  const session = createSplitSession(sourceTabId, sourceTab, targetTab, splitOptions);
+
+  await registerSplitSession(session);
+  notifySplitSource(session);
+  activateSplitTargetWhenReady(session, targetTab);
+
+  return buildSplitStartedResponse(session);
+}
+
+function getSplitSourceTabId(message, sender) {
+  return normalizeTabId(message.sourceTabId ?? message.tabId ?? sender?.tab?.id);
+}
+
+function getSplitRawOptions(message) {
+  return isPlainObject(message.options) ? message.options : {};
+}
+
+async function getSupportedSplitSourceTab(tabId) {
+  const sourceTab = await chrome.tabs.get(tabId);
   if (!isSupportedPageUrl(sourceTab.url)) {
     throw new Error("This page cannot be opened in split translation mode.");
   }
+  return sourceTab;
+}
 
-  const rawOptions = isPlainObject(message.options) ? message.options : {};
-  const splitOptions = sanitizeSplitOptions(rawOptions);
-  const targetTab = await createSplitTargetTab(sourceTab, rawOptions);
+function createSplitSession(sourceTabId, sourceTab, targetTab, options) {
   const targetTabId = normalizeTabId(targetTab.id);
   if (!Number.isInteger(targetTabId)) throw new Error("Failed to create translated split tab.");
 
-  const session = {
-    sourceTabId: normalizedSourceTabId,
+  return {
+    sourceTabId,
     targetTabId,
     sourceWindowId: normalizeTabId(sourceTab.windowId),
     targetWindowId: normalizeTabId(targetTab.windowId),
     url: sourceTab.url,
-    options: splitOptions,
+    options,
     createdAt: Date.now(),
     echoSuppressions: []
   };
+}
 
+async function registerSplitSession(session) {
   cacheSplitSession(session);
   pendingSplitTargets.set(session.targetTabId, session);
   await persistSplitSessions();
+}
 
+function notifySplitSource(session) {
   chrome.tabs.sendMessage(session.sourceTabId, {
     type: "START_SPLIT_SOURCE",
     sourceTabId: session.sourceTabId,
     targetTabId: session.targetTabId,
     splitRole: "source",
-    options: splitOptions
+    options: session.options
   }).catch(() => {});
+}
 
+function activateSplitTargetWhenReady(session, targetTab) {
   if (targetTab.status === "complete") {
     activatePendingSplitTarget(session.targetTabId).catch(() => {});
   }
+}
 
+function buildSplitStartedResponse(session) {
   return {
     translatedCount: 0,
     skippedCount: 0,
@@ -206,9 +308,9 @@ async function activatePendingSplitTarget(tabId) {
 }
 
 async function relaySplitScroll(message, sender) {
-  const senderTabId = normalizeTabId(sender?.tab?.id ?? message.fromTabId ?? message.tabId);
+  const senderTabId = getSplitScrollSenderTabId(message, sender);
   if (!Number.isInteger(senderTabId)) return { relayed: false, ignored: true, reason: "missing-sender" };
-  if (message.relayed === true || message._splitRelay === true) {
+  if (isRelayedSplitScrollMessage(message)) {
     return { relayed: false, ignored: true, reason: "already-relayed" };
   }
 
@@ -216,7 +318,7 @@ async function relaySplitScroll(message, sender) {
   const session = splitSessionsByTab.get(senderTabId);
   if (!session) return { relayed: false, ignored: true, reason: "no-session" };
 
-  const targetTabId = senderTabId === session.sourceTabId ? session.targetTabId : session.sourceTabId;
+  const targetTabId = getSplitPeerTabId(session, senderTabId);
   if (!Number.isInteger(targetTabId)) return { relayed: false, ignored: true, reason: "no-target" };
   if (shouldSuppressSplitScrollEcho(session, senderTabId, message)) {
     return { relayed: false, ignored: true, reason: "echo-suppressed" };
@@ -230,6 +332,14 @@ async function relaySplitScroll(message, sender) {
   return { relayed: true, toTabId: targetTabId, relayId };
 }
 
+function getSplitScrollSenderTabId(message, sender) {
+  return normalizeTabId(sender?.tab?.id ?? message.fromTabId ?? message.tabId);
+}
+
+function isRelayedSplitScrollMessage(message) {
+  return message.relayed === true || message._splitRelay === true;
+}
+
 async function clearSplitSession(tabId, { notifyTabs = true } = {}) {
   await ensureSplitSessionsLoaded();
   const normalizedTabId = normalizeTabId(tabId);
@@ -238,17 +348,12 @@ async function clearSplitSession(tabId, { notifyTabs = true } = {}) {
   const session = splitSessionsByTab.get(normalizedTabId);
   if (!session) return { cleared: false };
 
-  splitSessionsByTab.delete(session.sourceTabId);
-  splitSessionsByTab.delete(session.targetTabId);
-  pendingSplitTargets.delete(session.targetTabId);
+  deleteCachedSplitSession(session);
   await persistSplitSessions();
 
   if (!notifyTabs) return { cleared: true };
 
-  await Promise.allSettled([
-    chrome.tabs.sendMessage(session.sourceTabId, { type: "CLEAR_TRANSLATIONS" }),
-    chrome.tabs.sendMessage(session.targetTabId, { type: "CLEAR_TRANSLATIONS" })
-  ]);
+  await notifySplitSessionCleared(session);
 
   return { cleared: true };
 }
@@ -261,11 +366,30 @@ async function handleSplitTabRemoved(tabId) {
   const session = splitSessionsByTab.get(normalizedTabId);
   if (!session) return;
 
-  const remainingTabId = normalizedTabId === session.sourceTabId ? session.targetTabId : session.sourceTabId;
+  const remainingTabId = getSplitPeerTabId(session, normalizedTabId);
   await clearSplitSession(normalizedTabId, { notifyTabs: false });
   if (Number.isInteger(remainingTabId)) {
     await chrome.tabs.sendMessage(remainingTabId, { type: "CLEAR_TRANSLATIONS" }).catch(() => {});
   }
+}
+
+function deleteCachedSplitSession(session) {
+  splitSessionsByTab.delete(session.sourceTabId);
+  splitSessionsByTab.delete(session.targetTabId);
+  pendingSplitTargets.delete(session.targetTabId);
+}
+
+function notifySplitSessionCleared(session) {
+  return Promise.allSettled([
+    chrome.tabs.sendMessage(session.sourceTabId, { type: "CLEAR_TRANSLATIONS" }),
+    chrome.tabs.sendMessage(session.targetTabId, { type: "CLEAR_TRANSLATIONS" })
+  ]);
+}
+
+function getSplitPeerTabId(session, tabId) {
+  if (tabId === session.sourceTabId) return session.targetTabId;
+  if (tabId === session.targetTabId) return session.sourceTabId;
+  return null;
 }
 
 async function sendTabMessageWithRetry(tabId, message, { attempts = 6, delayMs = 250 } = {}) {
@@ -354,16 +478,14 @@ function isSupportedPageUrl(url) {
 }
 
 function sanitizeSplitOptions(options = {}) {
-  const safe = sanitizeOptions(options);
-  const allowedViewModes = new Set(["inline", "split"]);
-  const allowedDisplayModes = new Set(["below", "replace"]);
-  const allowedScopes = new Set(["viewport", "page"]);
+  const input = isPlainObject(options) ? options : {};
+  const safe = sanitizeOptions(input);
 
-  safe.viewMode = allowedViewModes.has(options.viewMode) ? options.viewMode : "split";
-  safe.displayMode = allowedDisplayModes.has(options.displayMode) ? options.displayMode : "replace";
-  safe.translateScope = allowedScopes.has(options.translateScope) ? options.translateScope : DEFAULT_SETTINGS.translateScope;
-  if (typeof options.skipTranslated === "boolean") safe.skipTranslated = options.skipTranslated;
-  if (Number.isFinite(Number(options.batchSize))) safe.batchSize = clamp(Number(options.batchSize), 1, 20);
+  safe.viewMode = ALLOWED_SPLIT_VIEW_MODES.has(input.viewMode) ? input.viewMode : "split";
+  safe.displayMode = ALLOWED_SPLIT_DISPLAY_MODES.has(input.displayMode) ? input.displayMode : "replace";
+  safe.translateScope = ALLOWED_SPLIT_SCOPES.has(input.translateScope) ? input.translateScope : DEFAULT_SETTINGS.translateScope;
+  if (typeof input.skipTranslated === "boolean") safe.skipTranslated = input.skipTranslated;
+  if (Number.isFinite(Number(input.batchSize))) safe.batchSize = clamp(Number(input.batchSize), 1, 20);
   safe.enabled = true;
 
   return safe;
@@ -432,27 +554,9 @@ function pruneSplitScrollEchoSuppressions(session) {
 }
 
 function getSplitScrollSignature(message) {
-  const keys = [
-    "blockId",
-    "scrollX",
-    "scrollY",
-    "pageXOffset",
-    "pageYOffset",
-    "scrollLeft",
-    "scrollTop",
-    "left",
-    "top",
-    "x",
-    "y",
-    "ratio",
-    "xRatio",
-    "scrollRatio",
-    "progress",
-    "percent"
-  ];
   const parts = [];
 
-  keys.forEach((key) => {
+  SPLIT_SCROLL_SIGNATURE_KEYS.forEach((key) => {
     if (!(key in message)) return;
     const value = message[key];
     if (typeof value === "number" && Number.isFinite(value)) {
@@ -469,24 +573,10 @@ function getSplitScrollSignature(message) {
 }
 
 function stableStringifyWithoutVolatileKeys(value) {
-  const volatileKeys = new Set([
-    "type",
-    "tabId",
-    "sourceTabId",
-    "targetTabId",
-    "fromTabId",
-    "toTabId",
-    "originTabId",
-    "relayId",
-    "relayed",
-    "_splitRelay",
-    "timestamp",
-    "ts"
-  ]);
   const safe = {};
 
   Object.keys(value || {}).sort().forEach((key) => {
-    if (volatileKeys.has(key)) return;
+    if (SPLIT_SCROLL_VOLATILE_KEYS.has(key)) return;
     const item = value[key];
     if (typeof item === "string" || typeof item === "number" || typeof item === "boolean" || item == null) {
       safe[key] = item;
@@ -525,16 +615,30 @@ async function getSettings(overrides = {}) {
 }
 
 async function migrateSecretsToLocal() {
+  if (secretsMigrationReady) return secretsMigrationReady;
+
+  secretsMigrationReady = migrateSecretsToLocalOnce().catch((error) => {
+    secretsMigrationReady = null;
+    throw error;
+  });
+
+  return secretsMigrationReady;
+}
+
+async function migrateSecretsToLocalOnce() {
   const secretKeys = Object.keys(SECRET_DEFAULTS);
   const legacy = await chrome.storage.sync.get(secretKeys);
   const nextSecrets = Object.fromEntries(
     Object.entries(legacy).filter(([, value]) => typeof value === "string" && value.length > 0)
   );
+  const legacyKeys = secretKeys.filter((key) => Object.prototype.hasOwnProperty.call(legacy, key));
 
   if (Object.keys(nextSecrets).length > 0) {
     await chrome.storage.local.set(nextSecrets);
   }
-  await chrome.storage.sync.remove(secretKeys);
+  if (legacyKeys.length > 0) {
+    await chrome.storage.sync.remove(legacyKeys);
+  }
 }
 
 async function translateBatch(texts, options = {}) {
@@ -574,34 +678,30 @@ async function translateBatchWithProvider(texts, settings) {
     case "microsoft":
       return translateWithMicrosoft(texts, settings);
     case "zhipu":
-      return translateWithOpenAICompatible(texts, {
-        ...settings,
-        openaiEndpoint: settings.zhipuEndpoint,
-        openaiApiKey: settings.zhipuApiKey,
-        openaiModel: settings.zhipuModel,
-        providerLabel: "Zhipu BigModel"
-      });
     case "gpt":
-      return translateWithOpenAICompatible(texts, {
-        ...settings,
-        openaiEndpoint: settings.gptEndpoint,
-        openaiApiKey: settings.gptApiKey,
-        openaiModel: settings.gptModel,
-        providerLabel: "GPT / OpenAI"
-      });
+    case "openai":
+      return translateWithOpenAICompatible(texts, getOpenAICompatibleSettings(settings));
     case "gemini":
       return translateWithGemini(texts, settings);
     case "claude":
       return translateWithClaude(texts, settings);
-    case "openai":
-      return translateWithOpenAICompatible(texts, {
-        ...settings,
-        providerLabel: "OpenAI-compatible"
-      });
     case "mymemory":
     default:
       return translateWithMyMemory(texts, settings);
   }
+}
+
+function getOpenAICompatibleSettings(settings) {
+  const providerConfig = OPENAI_COMPATIBLE_PROVIDER_CONFIG[settings.provider] || OPENAI_COMPATIBLE_PROVIDER_CONFIG.openai;
+  const overrides = {
+    providerLabel: providerConfig.providerLabel
+  };
+
+  if (providerConfig.endpointKey) overrides.openaiEndpoint = settings[providerConfig.endpointKey];
+  if (providerConfig.apiKeyKey) overrides.openaiApiKey = settings[providerConfig.apiKeyKey];
+  if (providerConfig.modelKey) overrides.openaiModel = settings[providerConfig.modelKey];
+
+  return { ...settings, ...overrides };
 }
 
 function buildRequestMeta(texts, settings) {
@@ -621,25 +721,9 @@ function buildRequestMeta(texts, settings) {
 }
 
 function getActiveModel(settings) {
-  switch (settings.provider) {
-    case "zhipu":
-      return settings.zhipuModel;
-    case "gpt":
-      return settings.gptModel;
-    case "gemini":
-      return settings.geminiModel;
-    case "claude":
-      return settings.claudeModel;
-    case "openai":
-      return settings.openaiModel;
-    case "microsoft":
-      return "Microsoft Translator";
-    case "google":
-      return "Google Translate";
-    case "mymemory":
-    default:
-      return "MyMemory";
-  }
+  const modelKey = PROVIDER_MODEL_KEYS[settings.provider];
+  if (modelKey) return settings[modelKey];
+  return PROVIDER_MODEL_LABELS[settings.provider] || PROVIDER_MODEL_LABELS.mymemory;
 }
 
 function estimateTokens(text) {
@@ -674,34 +758,31 @@ function sanitizeOptions(options = {}) {
 }
 
 function sanitizeSettings(options = {}) {
-  const allowedProviders = new Set(["google", "microsoft", "zhipu", "gpt", "gemini", "claude", "openai", "mymemory"]);
-  const allowedLangs = new Set(["auto", "ko", "en", "ja", "zh-CN", "zh-TW", "es", "fr", "de"]);
-  const allowedModels = {
-    zhipuModel: new Set(["glm-4-flash", "glm-4-air", "glm-4-plus"]),
-    gptModel: new Set(["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini", "gpt-4o"]),
-    geminiModel: new Set(["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]),
-    claudeModel: new Set(["claude-3-5-haiku-latest", "claude-3-5-sonnet-latest", "claude-3-7-sonnet-latest"])
-  };
+  const input = isPlainObject(options) ? options : {};
   const safe = {};
 
-  if (allowedProviders.has(options.provider)) safe.provider = options.provider;
-  if (allowedLangs.has(options.targetLang)) safe.targetLang = options.targetLang;
-  if (allowedLangs.has(options.sourceLang)) safe.sourceLang = options.sourceLang;
-  for (const [key, values] of Object.entries(allowedModels)) {
-    if (values.has(options[key])) safe[key] = options[key];
+  copyAllowedValue(safe, input, "provider", ALLOWED_PROVIDERS);
+  copyAllowedValue(safe, input, "targetLang", ALLOWED_LANGS);
+  copyAllowedValue(safe, input, "sourceLang", ALLOWED_LANGS);
+  for (const [key, values] of Object.entries(ALLOWED_MODELS)) {
+    copyAllowedValue(safe, input, key, values);
   }
-  if (typeof options.microsoftRegion === "string" && /^[a-z0-9-]{0,32}$/i.test(options.microsoftRegion)) {
-    safe.microsoftRegion = options.microsoftRegion;
+  if (typeof input.microsoftRegion === "string" && /^[a-z0-9-]{0,32}$/i.test(input.microsoftRegion)) {
+    safe.microsoftRegion = input.microsoftRegion;
   }
-  if (typeof options.openaiEndpoint === "string" && isAllowedOpenAICompatibleEndpoint(options.openaiEndpoint)) {
-    safe.openaiEndpoint = options.openaiEndpoint;
+  if (typeof input.openaiEndpoint === "string" && isAllowedOpenAICompatibleEndpoint(input.openaiEndpoint)) {
+    safe.openaiEndpoint = input.openaiEndpoint;
   }
-  if (typeof options.openaiModel === "string" && /^[A-Za-z0-9._:/-]{1,80}$/.test(options.openaiModel)) {
-    safe.openaiModel = options.openaiModel;
+  if (typeof input.openaiModel === "string" && /^[A-Za-z0-9._:/-]{1,80}$/.test(input.openaiModel)) {
+    safe.openaiModel = input.openaiModel;
   }
-  if (typeof options.keepTextLogs === "boolean") safe.keepTextLogs = options.keepTextLogs;
+  if (typeof input.keepTextLogs === "boolean") safe.keepTextLogs = input.keepTextLogs;
 
   return safe;
+}
+
+function copyAllowedValue(target, source, key, allowedValues) {
+  if (allowedValues.has(source[key])) target[key] = source[key];
 }
 
 function isAllowedOpenAICompatibleEndpoint(value) {
@@ -724,25 +805,42 @@ function sanitizeError(error) {
     .slice(0, 240);
 }
 
+function buildGoogleTranslateUrl(text, source, target) {
+  const url = new URL("https://translate.googleapis.com/translate_a/single");
+  url.searchParams.set("client", "gtx");
+  url.searchParams.set("sl", source);
+  url.searchParams.set("tl", target);
+  url.searchParams.set("dt", "t");
+  url.searchParams.set("q", text);
+  return url.toString();
+}
+
+function buildMyMemoryTranslateUrl(text, source, target) {
+  const url = new URL("https://api.mymemory.translated.net/get");
+  url.searchParams.set("q", text);
+  url.searchParams.set("langpair", `${source}|${target}`);
+  return url.toString();
+}
+
+async function fetchJsonOrThrow(resource, init, providerLabel) {
+  const response = await fetch(resource, init);
+  if (!response.ok) {
+    throw new Error(`${providerLabel} request failed: ${response.status}`);
+  }
+  return response.json();
+}
+
 async function translateWithGoogle(texts, settings) {
   const source = settings.sourceLang === "auto" ? "auto" : normalizeGoogleLang(settings.sourceLang);
   const target = normalizeGoogleLang(settings.targetLang);
   const translations = [];
 
   for (const text of texts) {
-    const url = new URL("https://translate.googleapis.com/translate_a/single");
-    url.searchParams.set("client", "gtx");
-    url.searchParams.set("sl", source);
-    url.searchParams.set("tl", target);
-    url.searchParams.set("dt", "t");
-    url.searchParams.set("q", text);
-
-    const response = await fetch(url.toString());
-    if (!response.ok) {
-      throw new Error(`Google Translate request failed: ${response.status}`);
-    }
-
-    const payload = await response.json();
+    const payload = await fetchJsonOrThrow(
+      buildGoogleTranslateUrl(text, source, target),
+      undefined,
+      "Google Translate"
+    );
     const translated = Array.isArray(payload?.[0])
       ? payload[0].map((part) => part?.[0] || "").join("")
       : "";
@@ -758,16 +856,7 @@ async function translateWithMyMemory(texts, settings) {
   const translations = [];
 
   for (const text of texts) {
-    const url = new URL("https://api.mymemory.translated.net/get");
-    url.searchParams.set("q", text);
-    url.searchParams.set("langpair", `${source}|${target}`);
-
-    const response = await fetch(url.toString());
-    if (!response.ok) {
-      throw new Error(`MyMemory request failed: ${response.status}`);
-    }
-
-    const payload = await response.json();
+    const payload = await fetchJsonOrThrow(buildMyMemoryTranslateUrl(text, source, target), undefined, "MyMemory");
     const translated = payload?.responseData?.translatedText;
     translations.push(cleanTranslation(translated || ""));
   }
@@ -795,17 +884,11 @@ async function translateWithMicrosoft(texts, settings) {
     headers["Ocp-Apim-Subscription-Region"] = settings.microsoftRegion;
   }
 
-  const response = await fetch(url.toString(), {
+  const payload = await fetchJsonOrThrow(url.toString(), {
     method: "POST",
     headers,
     body: JSON.stringify(texts.map((text) => ({ Text: text })))
-  });
-
-  if (!response.ok) {
-    throw new Error(`Microsoft Translator request failed: ${response.status}`);
-  }
-
-  const payload = await response.json();
+  }, "Microsoft Translator");
   return {
     translations: payload.map((item) => cleanTranslation(item?.translations?.[0]?.text || ""))
   };
@@ -816,7 +899,7 @@ async function translateWithOpenAICompatible(texts, settings) {
     throw new Error(`${settings.providerLabel || "OpenAI-compatible"} API key is missing. Set it in extension options.`);
   }
 
-  const response = await fetch(settings.openaiEndpoint, {
+  const payload = await fetchJsonOrThrow(settings.openaiEndpoint, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -828,8 +911,7 @@ async function translateWithOpenAICompatible(texts, settings) {
       messages: [
         {
           role: "system",
-          content:
-            "Translate each input string faithfully. Preserve meaning, names, numbers, punctuation, and inline whitespace. Return only a JSON array of translated strings."
+          content: TRANSLATION_JSON_ARRAY_INSTRUCTION
         },
         {
           role: "user",
@@ -841,13 +923,8 @@ async function translateWithOpenAICompatible(texts, settings) {
         }
       ]
     })
-  });
+  }, settings.providerLabel || "OpenAI-compatible");
 
-  if (!response.ok) {
-    throw new Error(`${settings.providerLabel || "OpenAI-compatible"} request failed: ${response.status}`);
-  }
-
-  const payload = await response.json();
   const content = payload?.choices?.[0]?.message?.content;
   const parsed = parseJsonArray(content);
   if (!parsed || parsed.length !== texts.length) {
@@ -866,7 +943,7 @@ async function translateWithGemini(texts, settings) {
   }
 
   const endpoint = `${settings.geminiEndpoint.replace(/\/$/, "")}/models/${encodeURIComponent(settings.geminiModel)}:generateContent`;
-  const response = await fetch(endpoint, {
+  const payload = await fetchJsonOrThrow(endpoint, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -888,13 +965,8 @@ async function translateWithGemini(texts, settings) {
         }
       ]
     })
-  });
+  }, "Gemini");
 
-  if (!response.ok) {
-    throw new Error(`Gemini request failed: ${response.status}`);
-  }
-
-  const payload = await response.json();
   const content = payload?.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("");
   return {
     translations: parseTranslations(content, texts.length),
@@ -907,7 +979,7 @@ async function translateWithClaude(texts, settings) {
     throw new Error("Claude API key is missing. Set it in extension options.");
   }
 
-  const response = await fetch(settings.claudeEndpoint, {
+  const payload = await fetchJsonOrThrow(settings.claudeEndpoint, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -919,8 +991,7 @@ async function translateWithClaude(texts, settings) {
       model: settings.claudeModel,
       max_tokens: 4096,
       temperature: 0.1,
-      system:
-        "Translate faithfully. Preserve meaning, names, numbers, punctuation, and inline whitespace. Return only a JSON array of translated strings.",
+      system: CLAUDE_SYSTEM_INSTRUCTION,
       messages: [
         {
           role: "user",
@@ -928,13 +999,8 @@ async function translateWithClaude(texts, settings) {
         }
       ]
     })
-  });
+  }, "Claude");
 
-  if (!response.ok) {
-    throw new Error(`Claude request failed: ${response.status}`);
-  }
-
-  const payload = await response.json();
   const content = payload?.content?.map((part) => part.text || "").join("");
   return {
     translations: parseTranslations(content, texts.length),

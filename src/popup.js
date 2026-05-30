@@ -1,24 +1,4 @@
-const DEFAULT_SETTINGS = {
-  provider: "google",
-  targetLang: "ko",
-  sourceLang: "en",
-  viewMode: "inline",
-  displayMode: "below",
-  translateScope: "viewport",
-  skipTranslated: true,
-  batchSize: 6,
-  openaiEndpoint: "https://api.openai.com/v1/chat/completions",
-  openaiModel: "gpt-4o-mini",
-  microsoftRegion: "",
-  zhipuEndpoint: "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-  zhipuModel: "glm-4-flash",
-  gptEndpoint: "https://api.openai.com/v1/chat/completions",
-  gptModel: "gpt-4.1-mini",
-  geminiEndpoint: "https://generativelanguage.googleapis.com/v1beta",
-  geminiModel: "gemini-2.0-flash",
-  claudeEndpoint: "https://api.anthropic.com/v1/messages",
-  claudeModel: "claude-3-5-haiku-latest"
-};
+const DEFAULT_SETTINGS = globalThis.BIT_DEFAULT_SETTINGS;
 
 const provider = document.querySelector("#provider");
 const microsoftRegion = document.querySelector("#microsoftRegion");
@@ -45,10 +25,28 @@ const batchHelp = document.querySelector("#batchHelp");
 const message = document.querySelector("#message");
 const statusDot = document.querySelector("#statusDot");
 
-init().catch((error) => setMessage(error.message || "초기화에 실패했습니다."));
+const POPUP_MESSAGES = Object.freeze({
+  initFailed: "초기화에 실패했습니다.",
+  saveFailed: "설정 저장에 실패했습니다.",
+  pageUnavailable: "현재 페이지에서 실행할 수 없습니다.",
+  translateBusy: "번역 적용 중...",
+  clearBusy: "번역 제거 중...",
+  translateFailed: "번역을 완료하지 못했습니다.",
+  tabScriptMissing: "현재 탭에 확장 스크립트가 준비되지 않았습니다. 페이지를 새로고침한 뒤 다시 시도하세요.",
+  splitClearFailed: "분할 보기 세션을 초기화하지 못했습니다.",
+  invalidCompatibleEndpoint: "OpenAI-compatible endpoint는 HTTPS URL이어야 하며 /chat/completions로 끝나야 합니다.",
+  compatibleEndpointDenied: "OpenAI-compatible endpoint 권한이 승인되지 않아 저장하지 않았습니다."
+});
+
+const TRANSLATION_RESULT_SUFFIX = Object.freeze({
+  inline: "스크롤하면 이어서 번역합니다.",
+  split: "분할 보기에서 표시합니다."
+});
+
+init().catch((error) => setMessage(error.message || POPUP_MESSAGES.initFailed));
 
 async function init() {
-  const settings = { ...DEFAULT_SETTINGS, ...(await chrome.storage.sync.get(Object.keys(DEFAULT_SETTINGS))) };
+  const settings = await chrome.storage.sync.get(DEFAULT_SETTINGS);
   fill(settings);
   bindAutoSave();
   refreshStatus();
@@ -77,56 +75,15 @@ function fill(settings) {
 function bindAutoSave() {
   document.querySelectorAll("select, input").forEach((control) => {
     control.addEventListener("change", () => {
-      savePublicSettings().catch((error) => setMessage(error.message || "설정 저장에 실패했습니다."));
+      savePublicSettings().catch((error) => setMessage(error.message || POPUP_MESSAGES.saveFailed));
     });
   });
   provider.addEventListener("change", syncProviderFields);
   viewMode.addEventListener("change", syncViewModeFields);
 }
 
-translateBtn.addEventListener("click", async () => {
-  setBusy(true, "적용 중...");
-  try {
-    const publicSettings = readPublicSettings();
-    await ensureEndpointPermission(publicSettings);
-    await chrome.storage.sync.set(publicSettings);
-    const tab = await getActiveTab();
-    const response = await startTranslation(tab, publicSettings);
-
-    if (!response?.ok) throw new Error(response?.error || "번역 실패");
-    const translatedCount = Number(response.translatedCount) || 0;
-    const suffix = publicSettings.viewMode === "split" ? "분할 보기에서 표시합니다." : "스크롤하면 이어서 번역합니다.";
-    setMessage(`${translatedCount}개 문단 번역 완료. ${suffix}`);
-    refreshStatus();
-  } catch (error) {
-    setMessage(error.message || "현재 페이지에서 실행할 수 없습니다.");
-  } finally {
-    setBusy(false);
-  }
-});
-
-clearBtn.addEventListener("click", async () => {
-  setBusy(true, "비적용 중...");
-  try {
-    const tab = await getActiveTab();
-    let clearError = null;
-    try {
-      await sendTabMessage(tab.id, { type: "CLEAR_TRANSLATIONS" });
-    } catch (error) {
-      clearError = error;
-    }
-
-    await clearSplitSession(tab.id);
-    if (clearError) throw clearError;
-
-    setMessage("비적용했습니다.");
-    refreshStatus();
-  } catch (error) {
-    setMessage(error.message || "현재 페이지에서 실행할 수 없습니다.");
-  } finally {
-    setBusy(false);
-  }
-});
+translateBtn.addEventListener("click", () => runPopupAction(POPUP_MESSAGES.translateBusy, applyTranslation));
+clearBtn.addEventListener("click", () => runPopupAction(POPUP_MESSAGES.clearBusy, clearCurrentTabTranslations));
 
 optionsBtn.addEventListener("click", () => {
   chrome.runtime.openOptionsPage();
@@ -142,6 +99,49 @@ async function savePublicSettings() {
   const nextSettings = readPublicSettings();
   await ensureEndpointPermission(nextSettings);
   await chrome.storage.sync.set(nextSettings);
+}
+
+async function runPopupAction(busyMessage, action) {
+  setBusy(true, busyMessage);
+  try {
+    await action();
+  } catch (error) {
+    setMessage(error.message || POPUP_MESSAGES.pageUnavailable);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function applyTranslation() {
+  const publicSettings = readPublicSettings();
+  await ensureEndpointPermission(publicSettings);
+  await chrome.storage.sync.set(publicSettings);
+
+  const tab = await getActiveTab();
+  const response = await requestTranslation(tab, publicSettings);
+  requireOkResponse(response, POPUP_MESSAGES.translateFailed);
+
+  const translatedCount = Number(response.translatedCount) || 0;
+  const suffix = TRANSLATION_RESULT_SUFFIX[publicSettings.viewMode] || TRANSLATION_RESULT_SUFFIX.inline;
+  setMessage(`${translatedCount}개 문단 번역 완료. ${suffix}`);
+  refreshStatus();
+}
+
+async function clearCurrentTabTranslations() {
+  const tab = await getActiveTab();
+  let clearError = null;
+
+  try {
+    await sendTabMessage(tab.id, { type: "CLEAR_TRANSLATIONS" });
+  } catch (error) {
+    clearError = error;
+  }
+
+  await clearSplitSession(tab.id);
+  if (clearError) throw clearError;
+
+  setMessage("번역을 제거했습니다.");
+  refreshStatus();
 }
 
 function readPublicSettings() {
@@ -206,7 +206,7 @@ async function sendTabMessage(tabId, payload, { optional = false } = {}) {
     return await chrome.tabs.sendMessage(tabId, payload);
   } catch (error) {
     if (optional || isTransientExtensionError(error)) return null;
-    throw new Error("현재 탭에 확장 스크립트가 준비되지 않았습니다. 페이지를 새로고침한 뒤 다시 시도하세요.");
+    throw new Error(POPUP_MESSAGES.tabScriptMissing);
   }
 }
 
@@ -229,7 +229,7 @@ function isTransientExtensionError(error) {
   );
 }
 
-async function startTranslation(tab, publicSettings) {
+async function requestTranslation(tab, publicSettings) {
   const options = readRuntimeOptions(publicSettings);
   if (publicSettings.viewMode === "split") {
     return sendRuntimeMessage({
@@ -245,6 +245,11 @@ async function startTranslation(tab, publicSettings) {
   });
 }
 
+function requireOkResponse(response, fallbackMessage) {
+  if (response?.ok) return;
+  throw new Error(response?.error || fallbackMessage);
+}
+
 function readRuntimeOptions(publicSettings) {
   const runtimeOptions = { ...publicSettings, enabled: true };
   if (runtimeOptions.viewMode === "split") {
@@ -256,7 +261,7 @@ function readRuntimeOptions(publicSettings) {
 async function clearSplitSession(tabId) {
   const response = await sendRuntimeMessage({ type: "CLEAR_SPLIT_SESSION", tabId }, { optional: true });
   if (response?.ok === false) {
-    throw new Error(response.error || "분할 보기 세션을 초기화하지 못했습니다.");
+    throw new Error(response.error || POPUP_MESSAGES.splitClearFailed);
   }
 }
 
@@ -288,12 +293,7 @@ function clamp(value, min, max) {
 async function ensureEndpointPermission(nextSettings) {
   if (nextSettings.provider !== "openai") return;
 
-  let url;
-  try {
-    url = new URL(nextSettings.openaiEndpoint);
-  } catch {
-    throw new Error("Compatible endpoint URL이 올바르지 않습니다.");
-  }
+  const url = parseOpenAICompatibleEndpoint(nextSettings.openaiEndpoint);
   if (url.hostname === "api.openai.com") return;
 
   const origin = `${url.origin}/*`;
@@ -302,6 +302,18 @@ async function ensureEndpointPermission(nextSettings) {
 
   const granted = await chrome.permissions.request({ origins: [origin] });
   if (!granted) {
-    throw new Error("Compatible endpoint 권한이 승인되지 않아 저장하지 않았습니다.");
+    throw new Error(POPUP_MESSAGES.compatibleEndpointDenied);
+  }
+}
+
+function parseOpenAICompatibleEndpoint(value) {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.username || url.password || !url.pathname.endsWith("/chat/completions")) {
+      throw new Error();
+    }
+    return url;
+  } catch {
+    throw new Error(POPUP_MESSAGES.invalidCompatibleEndpoint);
   }
 }

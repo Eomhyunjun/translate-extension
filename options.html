@@ -13,12 +13,12 @@
         <p>API 키는 로컬 저장소에만 저장됩니다. 사용 로그에는 번역 요청 텍스트 미리보기와 추정 토큰 수가 포함됩니다.</p>
       </header>
 
-      <nav class="tabs" aria-label="상세 설정 탭">
-        <button id="keysTab" class="tab active" type="button">API 키</button>
-        <button id="logsTab" class="tab" type="button">사용 로그</button>
+      <nav class="tabs" aria-label="상세 설정 탭" role="tablist">
+        <button id="keysTab" class="tab active" type="button" role="tab" aria-controls="keysPanel" aria-selected="true">API 키</button>
+        <button id="logsTab" class="tab" type="button" role="tab" aria-controls="logsPanel" aria-selected="false">사용 로그</button>
       </nav>
 
-      <section id="keysPanel">
+      <section id="keysPanel" role="tabpanel" aria-labelledby="keysTab">
         <h2>API 키</h2>
         <label class="field">
           <span>Microsoft Translator</span>
@@ -51,11 +51,11 @@
         </div>
       </section>
 
-      <section id="logsPanel" hidden>
+      <section id="logsPanel" role="tabpanel" aria-labelledby="logsTab" hidden>
         <div class="section-heading">
           <div>
             <h2>사용 로그</h2>
-        <p>로그 저장은 기본 꺼짐입니다. 켜면 최대 100개 요청 배치를 로컬에 보관하고 입력/출력 텍스트 미리보기와 실제 또는 추정 토큰 수를 표시합니다.</p>
+            <p>로그 저장은 기본 꺼짐입니다. 켜면 최대 100개 요청 배치를 로컬에 보관하고 입력/출력 텍스트 미리보기와 실제 또는 추정 토큰 수를 표시합니다.</p>
           </div>
           <button id="clearLogsBtn" type="button">로그 삭제</button>
         </div>
@@ -71,6 +71,7 @@
 
       <p id="message" class="message" role="status"></p>
     </main>
+    <script src="src/defaults.js"></script>
     <script src="src/options.js"></script>
   </body>
 </html>

@@ -1,13 +1,4 @@
-const DEFAULT_SETTINGS = {
-  provider: "google",
-  targetLang: "ko",
-  sourceLang: "en",
-  viewMode: "inline",
-  displayMode: "below",
-  translateScope: "viewport",
-  skipTranslated: true,
-  batchSize: 6
-};
+const DEFAULT_SETTINGS = globalThis.BIT_DEFAULT_SETTINGS;
 
 const BLOCK_SELECTOR = [
   "article p",
@@ -84,20 +75,20 @@ const EXCLUDED_SELECTOR = [
   "[contenteditable='true']"
 ].join(",");
 
-let activeRun = 0;
-let settings = { ...DEFAULT_SETTINGS };
-let autoTranslateTimer = null;
-let isAutoTranslating = false;
-let isSplitTargetTranslating = false;
-let nextBlockId = 1;
-let contextAlive = true;
-let lastViewportSignature = "";
-const splitTranslationCache = new Map();
-const splitTextReplacements = new Map();
 const instanceId = `bit-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-const cleanupHandlers = [];
 const SPLIT_SCROLL_THROTTLE_MS = 120;
 const SPLIT_SCROLL_SUPPRESS_MS = 700;
+const runtimeState = {
+  activeRun: 0,
+  settings: { ...DEFAULT_SETTINGS },
+  autoTranslateTimer: null,
+  isAutoTranslating: false,
+  isSplitTargetTranslating: false,
+  nextBlockId: 1,
+  contextAlive: true,
+  lastViewportSignature: "",
+  cleanupHandlers: []
+};
 const splitState = {
   active: false,
   role: null,
@@ -105,7 +96,9 @@ const splitState = {
   scrollTimer: null,
   releaseTimer: null,
   suppressUntil: 0,
-  lastSentKey: ""
+  lastSentKey: "",
+  translationCache: new Map(),
+  textReplacements: new Map()
 };
 
 if (typeof window.__bitTranslatorCleanup === "function") {
@@ -133,14 +126,14 @@ function initializeContentScript() {
       disableRuntime();
       return;
     }
-    settings = { ...DEFAULT_SETTINGS, ...stored, enabled: false };
+    runtimeState.settings = { ...DEFAULT_SETTINGS, ...stored, enabled: false };
   });
 
   chrome.storage.onChanged.addListener((changes, area) => {
-    if (area !== "sync" || !contextAlive) return;
+    if (area !== "sync" || !runtimeState.contextAlive) return;
     for (const [key, change] of Object.entries(changes)) {
       if (key === "enabled") continue;
-      settings[key] = change.newValue;
+      runtimeState.settings[key] = change.newValue;
     }
   });
 
@@ -152,19 +145,19 @@ function initializeContentScript() {
   addDomListener(window, "resize", handlePossibleViewportChange, { passive: true });
 
   chrome.runtime.onMessage.addListener(handleRuntimeMessage);
-  cleanupHandlers.push(() => chrome.runtime.onMessage.removeListener(handleRuntimeMessage));
+  runtimeState.cleanupHandlers.push(() => chrome.runtime.onMessage.removeListener(handleRuntimeMessage));
 }
 
 function addDomListener(target, type, listener, options) {
   target.addEventListener(type, listener, options);
-  cleanupHandlers.push(() => target.removeEventListener(type, listener, options));
+  runtimeState.cleanupHandlers.push(() => target.removeEventListener(type, listener, options));
 }
 
 function cleanupContentScript() {
-  contextAlive = false;
+  runtimeState.contextAlive = false;
   stopTranslationRuntime();
-  while (cleanupHandlers.length > 0) {
-    const cleanup = cleanupHandlers.pop();
+  while (runtimeState.cleanupHandlers.length > 0) {
+    const cleanup = runtimeState.cleanupHandlers.pop();
     try {
       cleanup();
     } catch {
@@ -208,7 +201,7 @@ function handleRuntimeMessage(message, _sender, sendResponse) {
   }
 
   if (message?.type === "CLEAR_TRANSLATIONS") {
-    activeRun += 1;
+    cancelActiveTranslations();
     stopTranslationRuntime();
     clearTranslations();
     safeSendResponse(sendResponse, { ok: true });
@@ -218,7 +211,7 @@ function handleRuntimeMessage(message, _sender, sendResponse) {
   if (message?.type === "GET_PAGE_STATUS") {
     safeSendResponse(sendResponse, {
       ok: true,
-      translatedCount: document.querySelectorAll(".bit-translation").length + splitTextReplacements.size
+      translatedCount: document.querySelectorAll(".bit-translation").length + splitState.textReplacements.size
     });
     return false;
   }
@@ -226,23 +219,37 @@ function handleRuntimeMessage(message, _sender, sendResponse) {
   return false;
 }
 
+function cancelActiveTranslations() {
+  runtimeState.activeRun += 1;
+  return runtimeState.activeRun;
+}
+
+function isActiveRun(runId) {
+  return runId === runtimeState.activeRun;
+}
+
+function mergeRuntimeSettings(overrides) {
+  runtimeState.settings = { ...runtimeState.settings, ...overrides };
+  return runtimeState.settings;
+}
+
 async function translatePage(overrides = {}) {
-  if (!contextAlive) return { translatedCount: 0, skippedCount: 0 };
-  const runId = ++activeRun;
-  settings = { ...settings, ...overrides };
+  if (!runtimeState.contextAlive) return { translatedCount: 0, skippedCount: 0 };
+  const runId = cancelActiveTranslations();
+  mergeRuntimeSettings(overrides);
   if (!overrides.auto) stopSplitMode();
   if (!overrides.auto) syncAutoMode();
 
-  if (!settings.enabled) clearTranslations();
-  const blocks = collectBlocks(settings);
+  if (!runtimeState.settings.enabled) clearTranslations();
+  const blocks = collectBlocks(runtimeState.settings);
   if (blocks.length === 0) return { translatedCount: 0, skippedCount: 0 };
 
   let translatedCount = 0;
-  const batchSize = clamp(Number(settings.batchSize) || DEFAULT_SETTINGS.batchSize, 1, 20);
+  const batchSize = getTranslationBatchSize(runtimeState.settings);
   const groups = groupBlocksByText(blocks);
 
   for (let index = 0; index < groups.length; index += batchSize) {
-    if (runId !== activeRun) break;
+    if (!isActiveRun(runId)) break;
 
     const batch = groups.slice(index, index + batchSize);
     markPending(batch.flatMap((group) => group.blocks));
@@ -250,7 +257,7 @@ async function translatePage(overrides = {}) {
     const response = await sendRuntimeMessage({
       type: "TRANSLATE_BATCH",
       texts: batch.map((group) => group.text),
-      options: pickRuntimeOptions(settings)
+      options: pickRuntimeOptions(runtimeState.settings)
     });
 
     if (!response) {
@@ -264,9 +271,9 @@ async function translatePage(overrides = {}) {
 
     response.translations.forEach((translation, offset) => {
       const group = batch[offset];
-      if (!group || !translation || runId !== activeRun) return;
+      if (!group || !translation || !isActiveRun(runId)) return;
       group.blocks.forEach((item) => {
-        renderTranslation(item.element, translation, settings.displayMode);
+        renderTranslation(item.element, translation, runtimeState.settings.displayMode);
         translatedCount += 1;
       });
     });
@@ -277,9 +284,9 @@ async function translatePage(overrides = {}) {
 
 async function startSplitSource(message = {}) {
   const options = getMessageOptions(message);
-  activeRun += 1;
+  cancelActiveTranslations();
   clearTranslations();
-  settings = { ...settings, ...options, enabled: false };
+  mergeRuntimeSettings({ ...options, enabled: false });
   stopAutoMode();
   startSplitMode("source", message);
   return { translatedCount: 0, skippedCount: 0 };
@@ -301,10 +308,7 @@ function startSplitMode(role, message = {}) {
   splitState.active = true;
   splitState.role = role;
   splitState.splitId = message.splitId || message.sessionId || message.options?.splitId || null;
-  splitState.suppressUntil = 0;
-  splitState.lastSentKey = "";
-  window.clearTimeout(splitState.scrollTimer);
-  splitState.scrollTimer = null;
+  resetSplitScrollTracking();
   scheduleSplitScroll({ immediate: true });
 }
 
@@ -314,9 +318,9 @@ function getMessageOptions(message = {}) {
 }
 
 function scheduleAutoTranslate() {
-  if (!contextAlive) return;
-  window.clearTimeout(autoTranslateTimer);
-  autoTranslateTimer = window.setTimeout(() => {
+  if (!runtimeState.contextAlive) return;
+  window.clearTimeout(runtimeState.autoTranslateTimer);
+  runtimeState.autoTranslateTimer = window.setTimeout(() => {
     translateVisibleIfEnabled().catch((error) => {
       if (!isContextInvalidatedError(error)) console.warn("Auto translation failed", error);
     });
@@ -324,12 +328,18 @@ function scheduleAutoTranslate() {
 }
 
 function handlePossibleViewportChange() {
-  if (contextAlive && settings.enabled && settings.translateScope === "viewport") scheduleAutoTranslate();
+  if (
+    runtimeState.contextAlive &&
+    runtimeState.settings.enabled &&
+    runtimeState.settings.translateScope === "viewport"
+  ) {
+    scheduleAutoTranslate();
+  }
   scheduleSplitScroll();
 }
 
 function scheduleSplitScroll({ immediate = false } = {}) {
-  if (!contextAlive || !splitState.active || Date.now() < splitState.suppressUntil) return;
+  if (!canSyncSplitScroll()) return;
 
   if (immediate) {
     sendSplitScroll();
@@ -344,9 +354,60 @@ function scheduleSplitScroll({ immediate = false } = {}) {
 }
 
 function sendSplitScroll() {
-  if (!contextAlive || !splitState.active || Date.now() < splitState.suppressUntil) return;
+  if (!canSyncSplitScroll()) return;
   const scroll = getSplitScrollPosition();
-  const key = [
+  const key = getSplitScrollKey(scroll);
+  if (key === splitState.lastSentKey) return;
+  splitState.lastSentKey = key;
+
+  sendRuntimeMessage(buildSplitScrollMessage(scroll), { optional: true }).catch((error) => {
+    if (!isContextInvalidatedError(error)) console.warn("Split scroll update failed", error);
+  });
+}
+
+function applySplitScroll(message) {
+  if (!runtimeState.contextAlive || !splitState.active) return;
+  const incoming = message.scroll || message.position || message;
+  if (isOwnSplitScrollMessage(message, incoming)) return;
+
+  const target = resolveSplitScrollTarget(incoming);
+  if (!target) return;
+
+  if (isNearScrollTarget(getWindowScrollPoint(), target)) return;
+
+  const releaseAt = beginSplitScrollSuppression();
+  window.scrollTo({ left: target.x, top: target.y, behavior: "auto" });
+  scheduleSplitScrollRelease(releaseAt);
+
+  if (runtimeState.settings.enabled && runtimeState.settings.translateScope === "viewport") scheduleAutoTranslate();
+}
+
+function canSyncSplitScroll() {
+  return runtimeState.contextAlive && splitState.active && !isSplitScrollSuppressed();
+}
+
+function isSplitScrollSuppressed() {
+  return Date.now() < splitState.suppressUntil;
+}
+
+function resetSplitScrollTracking() {
+  splitState.suppressUntil = 0;
+  splitState.lastSentKey = "";
+  clearSplitScrollTimer();
+}
+
+function clearSplitScrollTimer() {
+  window.clearTimeout(splitState.scrollTimer);
+  splitState.scrollTimer = null;
+}
+
+function clearSplitReleaseTimer() {
+  window.clearTimeout(splitState.releaseTimer);
+  splitState.releaseTimer = null;
+}
+
+function getSplitScrollKey(scroll) {
+  return [
     Math.round(scroll.x),
     Math.round(scroll.y),
     Math.round(scroll.maxX),
@@ -354,10 +415,10 @@ function sendSplitScroll() {
     splitState.role,
     splitState.splitId || ""
   ].join(":");
-  if (key === splitState.lastSentKey) return;
-  splitState.lastSentKey = key;
+}
 
-  sendRuntimeMessage({
+function buildSplitScrollMessage(scroll) {
+  return {
     type: "SPLIT_SCROLL",
     role: splitState.role,
     splitRole: splitState.role,
@@ -366,35 +427,37 @@ function sendSplitScroll() {
     href: window.location.href,
     ...scroll,
     scroll
-  }, { optional: true }).catch((error) => {
-    if (!isContextInvalidatedError(error)) console.warn("Split scroll update failed", error);
-  });
+  };
 }
 
-function applySplitScroll(message) {
-  if (!contextAlive || !splitState.active) return;
-  const incoming = message.scroll || message.position || message;
+function isOwnSplitScrollMessage(message, incoming) {
   const incomingInstanceId = message.instanceId || incoming.instanceId || message.originInstanceId;
-  if (incomingInstanceId && incomingInstanceId === instanceId) return;
+  return incomingInstanceId && incomingInstanceId === instanceId;
+}
 
-  const target = resolveSplitScrollTarget(incoming);
-  if (!target) return;
+function getWindowScrollPoint() {
+  return {
+    x: window.scrollX || document.scrollingElement?.scrollLeft || 0,
+    y: window.scrollY || document.scrollingElement?.scrollTop || 0
+  };
+}
 
-  const currentX = window.scrollX || document.scrollingElement?.scrollLeft || 0;
-  const currentY = window.scrollY || document.scrollingElement?.scrollTop || 0;
-  if (Math.abs(currentX - target.x) < 2 && Math.abs(currentY - target.y) < 2) return;
+function isNearScrollTarget(current, target) {
+  return Math.abs(current.x - target.x) < 2 && Math.abs(current.y - target.y) < 2;
+}
 
+function beginSplitScrollSuppression() {
   const releaseAt = Date.now() + SPLIT_SCROLL_SUPPRESS_MS;
   splitState.suppressUntil = releaseAt;
-  window.clearTimeout(splitState.scrollTimer);
-  window.clearTimeout(splitState.releaseTimer);
-  splitState.scrollTimer = null;
-  window.scrollTo({ left: target.x, top: target.y, behavior: "auto" });
+  clearSplitScrollTimer();
+  clearSplitReleaseTimer();
+  return releaseAt;
+}
+
+function scheduleSplitScrollRelease(releaseAt) {
   splitState.releaseTimer = window.setTimeout(() => {
     if (splitState.suppressUntil === releaseAt) splitState.suppressUntil = 0;
   }, SPLIT_SCROLL_SUPPRESS_MS);
-
-  if (settings.enabled && settings.translateScope === "viewport") scheduleAutoTranslate();
 }
 
 function getSplitScrollPosition() {
@@ -442,7 +505,11 @@ function resolveSplitScrollTarget(scroll) {
 }
 
 function syncAutoMode() {
-  if (contextAlive && settings.enabled && settings.translateScope === "viewport") {
+  if (
+    runtimeState.contextAlive &&
+    runtimeState.settings.enabled &&
+    runtimeState.settings.translateScope === "viewport"
+  ) {
     startAutoMode();
   } else {
     stopAutoMode();
@@ -454,77 +521,66 @@ function startAutoMode() {
 }
 
 function stopAutoMode() {
-  window.clearTimeout(autoTranslateTimer);
-  autoTranslateTimer = null;
+  window.clearTimeout(runtimeState.autoTranslateTimer);
+  runtimeState.autoTranslateTimer = null;
 }
 
 async function translateVisibleIfEnabled() {
-  if (!contextAlive || !settings.enabled || isAutoTranslating || isSplitTargetTranslating) return;
+  if (
+    !runtimeState.contextAlive ||
+    !runtimeState.settings.enabled ||
+    runtimeState.isAutoTranslating ||
+    runtimeState.isSplitTargetTranslating
+  ) {
+    return;
+  }
   const signature = splitState.role === "target" ? getSplitViewportSignature() : getViewportSignature();
-  if (signature && signature === lastViewportSignature) return;
-  lastViewportSignature = signature;
-  isAutoTranslating = true;
+  if (signature && signature === runtimeState.lastViewportSignature) return;
+  runtimeState.lastViewportSignature = signature;
+  runtimeState.isAutoTranslating = true;
   try {
     if (splitState.role === "target") {
-      await translateSplitTarget({ ...settings, translateScope: "viewport", enabled: true, auto: true });
+      await translateSplitTarget({ ...runtimeState.settings, translateScope: "viewport", enabled: true, auto: true });
     } else {
-      await translatePage({ ...settings, translateScope: "viewport", enabled: true, auto: true });
+      await translatePage({ ...runtimeState.settings, translateScope: "viewport", enabled: true, auto: true });
     }
   } catch (error) {
     if (!isContextInvalidatedError(error)) {
       console.warn("Auto translation failed", error);
     }
   } finally {
-    isAutoTranslating = false;
+    runtimeState.isAutoTranslating = false;
   }
 }
 
 async function translateSplitTarget(overrides = {}) {
-  if (!contextAlive) return { translatedCount: 0, skippedCount: 0 };
-  if (overrides.auto && isSplitTargetTranslating) return { translatedCount: 0, skippedCount: 0 };
+  if (!runtimeState.contextAlive) return { translatedCount: 0, skippedCount: 0 };
+  if (overrides.auto && runtimeState.isSplitTargetTranslating) return { translatedCount: 0, skippedCount: 0 };
 
-  const runId = ++activeRun;
-  isSplitTargetTranslating = true;
+  const runId = cancelActiveTranslations();
+  runtimeState.isSplitTargetTranslating = true;
   try {
-    settings = { ...settings, ...overrides, viewMode: "inline", displayMode: "replace", enabled: true };
+    mergeRuntimeSettings({ ...overrides, viewMode: "inline", displayMode: "replace", enabled: true });
     const shouldSyncAutoMode = !overrides.auto;
 
-    const units = collectSplitTextUnits(settings);
+    const units = collectSplitTextUnits(runtimeState.settings);
     if (units.length === 0) {
       if (shouldSyncAutoMode) syncAutoMode();
       scheduleSplitScroll({ immediate: true });
       return { translatedCount: 0, skippedCount: 0 };
     }
 
-    let translatedCount = 0;
-    const batchSize = clamp(Number(settings.batchSize) || DEFAULT_SETTINGS.batchSize, 1, 20);
-    const missingGroups = [];
-    const missingByKey = new Map();
-
-    units.forEach((unit) => {
-      const key = splitCacheKey(unit.text, settings);
-      const cachedTranslation = splitTranslationCache.get(key);
-      if (cachedTranslation) {
-        if (replaceSplitTextUnit(unit, cachedTranslation)) translatedCount += 1;
-        return;
-      }
-
-      if (!missingByKey.has(key)) {
-        const group = { key, text: unit.text, units: [] };
-        missingByKey.set(key, group);
-        missingGroups.push(group);
-      }
-      missingByKey.get(key).units.push(unit);
-    });
+    let { translatedCount, missingGroups } = collectMissingSplitTranslationGroups(units, runtimeState.settings);
+    const batchSize = getTranslationBatchSize(runtimeState.settings);
 
     for (let index = 0; index < missingGroups.length; index += batchSize) {
-      if (runId !== activeRun) break;
+      if (!isActiveRun(runId)) break;
 
       const batch = missingGroups.slice(index, index + batchSize);
       const response = await sendRuntimeMessage({
         type: "TRANSLATE_BATCH",
         texts: batch.map((group) => group.text),
-        options: pickRuntimeOptions(settings)
+        options: pickRuntimeOptions(runtimeState.settings)
       });
 
       if (!response) {
@@ -537,12 +593,10 @@ async function translateSplitTarget(overrides = {}) {
 
       response.translations.forEach((translation, offset) => {
         const group = batch[offset];
-        if (!group || !translation || runId !== activeRun) return;
+        if (!group || !translation || !isActiveRun(runId)) return;
         const normalizedTranslation = String(translation);
-        splitTranslationCache.set(group.key, normalizedTranslation);
-        group.units.forEach((unit) => {
-          if (replaceSplitTextUnit(unit, normalizedTranslation)) translatedCount += 1;
-        });
+        cacheSplitTranslation(group.key, normalizedTranslation);
+        translatedCount += replaceSplitTextUnits(group.units, normalizedTranslation);
       });
     }
 
@@ -550,12 +604,16 @@ async function translateSplitTarget(overrides = {}) {
     if (shouldSyncAutoMode) syncAutoMode();
     return { translatedCount, skippedCount: units.length - translatedCount };
   } finally {
-    if (runId === activeRun) isSplitTargetTranslating = false;
+    if (isActiveRun(runId)) runtimeState.isSplitTargetTranslating = false;
   }
 }
 
 function getViewportSignature() {
-  const blocks = collectBlocks({ ...settings, translateScope: "viewport", viewMode: settings.viewMode });
+  const blocks = collectBlocks({
+    ...runtimeState.settings,
+    translateScope: "viewport",
+    viewMode: runtimeState.settings.viewMode
+  });
   return blocks
     .slice(0, 24)
     .map((item) => `${ensureBlockId(item.element)}:${item.text.slice(0, 80)}`)
@@ -563,7 +621,7 @@ function getViewportSignature() {
 }
 
 function getSplitViewportSignature() {
-  return collectSplitTextUnits({ ...settings, translateScope: "viewport" })
+  return collectSplitTextUnits({ ...runtimeState.settings, translateScope: "viewport" })
     .slice(0, 48)
     .map((unit) => `${ensureBlockId(unit.element)}:${unit.text.slice(0, 80)}`)
     .join("|");
@@ -578,50 +636,99 @@ function splitCacheKey(text, currentSettings) {
   ].join("\u0000");
 }
 
+function getCachedSplitTranslation(key) {
+  return splitState.translationCache.get(key);
+}
+
+function cacheSplitTranslation(key, translation) {
+  splitState.translationCache.set(key, translation);
+}
+
 function collectBlocks(currentSettings) {
-  const candidates = [
-    ...Array.from(document.querySelectorAll(BLOCK_SELECTOR)),
-    ...collectTextNodeContainers()
-  ];
   const seen = new Set();
   const blocks = [];
 
-  for (const element of candidates) {
+  for (const element of collectBlockCandidates()) {
     if (seen.has(element) || !isTranslatableElement(element)) continue;
     seen.add(element);
-    if (currentSettings.translateScope === "viewport" && !isElementInViewport(element)) continue;
-
-    const text = getElementText(element);
-    if (!isUsefulText(text)) continue;
-    if (element.dataset.bitTranslatedText === text) continue;
-    if (currentSettings.skipTranslated && currentSettings.targetLang === "ko" && looksMostlyKorean(text)) continue;
-
-    blocks.push({ element, text });
+    const block = createTranslatableBlock(element, currentSettings);
+    if (block) blocks.push(block);
   }
 
   return blocks;
 }
 
-function groupBlocksByText(blocks) {
-  const groups = [];
-  const byText = new Map();
+function collectBlockCandidates() {
+  return [
+    ...Array.from(document.querySelectorAll(BLOCK_SELECTOR)),
+    ...collectTextNodeContainers()
+  ];
+}
 
-  blocks.forEach((block) => {
-    const key = block.text;
-    if (!byText.has(key)) {
-      const group = { text: block.text, blocks: [] };
-      byText.set(key, group);
+function createTranslatableBlock(element, currentSettings) {
+  if (currentSettings.translateScope === "viewport" && !isElementInViewport(element)) return null;
+
+  const text = getElementText(element);
+  if (!isUsefulText(text)) return null;
+  if (element.dataset.bitTranslatedText === text) return null;
+  if (shouldSkipTranslatedText(text, currentSettings)) return null;
+
+  return { element, text };
+}
+
+function groupBlocksByText(blocks) {
+  return groupDuplicateTextItems(blocks, {
+    bucketName: "blocks",
+    getText: (block) => block.text
+  });
+}
+
+function collectMissingSplitTranslationGroups(units, currentSettings) {
+  let translatedCount = 0;
+  const missingGroups = [];
+  const groups = groupDuplicateTextItems(units, {
+    bucketName: "units",
+    getKey: (unit) => splitCacheKey(unit.text, currentSettings),
+    getText: (unit) => unit.text
+  });
+
+  groups.forEach((group) => {
+    const cachedTranslation = getCachedSplitTranslation(group.key);
+    if (cachedTranslation) {
+      translatedCount += replaceSplitTextUnits(group.units, cachedTranslation);
+      return;
+    }
+
+    missingGroups.push(group);
+  });
+
+  return { translatedCount, missingGroups };
+}
+
+function groupDuplicateTextItems(items, { bucketName, getText, getKey = getText }) {
+  const groups = [];
+  const byKey = new Map();
+
+  items.forEach((item) => {
+    const key = getKey(item);
+    if (!byKey.has(key)) {
+      const group = { key, text: getText(item), [bucketName]: [] };
+      byKey.set(key, group);
       groups.push(group);
     }
-    byText.get(key).blocks.push(block);
+    byKey.get(key)[bucketName].push(item);
   });
 
   return groups;
 }
 
+function getTranslationBatchSize(currentSettings) {
+  return clamp(Number(currentSettings.batchSize) || DEFAULT_SETTINGS.batchSize, 1, 20);
+}
+
 function ensureBlockId(element) {
   if (!element.dataset.bitBlockId) {
-    element.dataset.bitBlockId = `${instanceId}-${nextBlockId++}`;
+    element.dataset.bitBlockId = `${instanceId}-${runtimeState.nextBlockId++}`;
   }
   return element.dataset.bitBlockId;
 }
@@ -659,40 +766,56 @@ function collectSplitTextUnits(currentSettings) {
   const units = [];
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
-      if (splitTextReplacements.has(node)) return NodeFilter.FILTER_REJECT;
-
-      const text = normalizeText(node.nodeValue || "");
-      if (!isUsefulText(text)) return NodeFilter.FILTER_REJECT;
-      if (
-        currentSettings.skipTranslated &&
-        currentSettings.targetLang === "ko" &&
-        looksMostlyKorean(text)
-      ) {
-        return NodeFilter.FILTER_REJECT;
-      }
-
-      const parent = node.parentElement;
-      if (!parent || parent.closest(EXCLUDED_SELECTOR)) return NodeFilter.FILTER_REJECT;
-      if (parent.closest(".bit-replaced[data-bit-original-text]")) return NodeFilter.FILTER_REJECT;
-      if (!isElementVisible(parent)) return NodeFilter.FILTER_REJECT;
-      if (currentSettings.translateScope === "viewport" && !isElementInViewport(parent)) {
-        return NodeFilter.FILTER_REJECT;
-      }
-
-      return NodeFilter.FILTER_ACCEPT;
+      return getSplitTextNodeFilter(node, currentSettings);
     }
   });
 
   while (walker.nextNode()) {
-    const textNode = walker.currentNode;
-    units.push({
-      textNode,
-      element: textNode.parentElement,
-      text: normalizeText(textNode.nodeValue || "")
-    });
+    const unit = createSplitTextUnit(walker.currentNode);
+    if (unit) units.push(unit);
   }
 
   return units;
+}
+
+function getSplitTextNodeFilter(node, currentSettings) {
+  return isTranslatableSplitTextNode(node, currentSettings)
+    ? NodeFilter.FILTER_ACCEPT
+    : NodeFilter.FILTER_REJECT;
+}
+
+function isTranslatableSplitTextNode(node, currentSettings) {
+  if (splitState.textReplacements.has(node)) return false;
+
+  const text = normalizeText(node.nodeValue || "");
+  if (!isUsefulText(text)) return false;
+  if (shouldSkipTranslatedText(text, currentSettings)) return false;
+
+  const parent = node.parentElement;
+  if (!parent || parent.closest(EXCLUDED_SELECTOR)) return false;
+  if (parent.closest(".bit-replaced[data-bit-original-text]")) return false;
+  if (!isElementVisible(parent)) return false;
+  if (currentSettings.translateScope === "viewport" && !isElementInViewport(parent)) return false;
+
+  return true;
+}
+
+function createSplitTextUnit(textNode) {
+  const element = textNode.parentElement;
+  if (!element) return null;
+  return {
+    textNode,
+    element,
+    text: normalizeText(textNode.nodeValue || "")
+  };
+}
+
+function shouldSkipTranslatedText(text, currentSettings) {
+  return (
+    currentSettings.skipTranslated &&
+    currentSettings.targetLang === "ko" &&
+    looksMostlyKorean(text)
+  );
 }
 
 function getTextContainer(element) {
@@ -901,14 +1024,20 @@ function createTranslationNode(translation) {
 
 function replaceSplitTextUnit(unit, translation) {
   const textNode = unit.textNode;
-  if (!textNode?.isConnected || splitTextReplacements.has(textNode)) return false;
+  if (!textNode?.isConnected || splitState.textReplacements.has(textNode)) return false;
   if (normalizeText(textNode.nodeValue || "") !== unit.text) return false;
 
   const originalText = textNode.nodeValue || "";
   const translatedText = preserveTextNodeSpacing(originalText, translation);
-  splitTextReplacements.set(textNode, { originalText, translatedText });
+  splitState.textReplacements.set(textNode, { originalText, translatedText });
   textNode.nodeValue = translatedText;
   return true;
+}
+
+function replaceSplitTextUnits(units, translation) {
+  return units.reduce((count, unit) => (
+    replaceSplitTextUnit(unit, translation) ? count + 1 : count
+  ), 0);
 }
 
 function preserveTextNodeSpacing(originalText, translation) {
@@ -934,8 +1063,8 @@ function markFailed(batch, message) {
 }
 
 function clearTranslations(options = {}) {
-  splitTranslationCache.clear();
-  lastViewportSignature = "";
+  splitState.translationCache.clear();
+  runtimeState.lastViewportSignature = "";
   if (!options.keepSplit) stopSplitMode();
   restoreSplitTextReplacements();
   document.querySelectorAll(".bit-translation").forEach((node) => node.remove());
@@ -956,25 +1085,21 @@ function clearTranslations(options = {}) {
 }
 
 function restoreSplitTextReplacements() {
-  splitTextReplacements.forEach((state, textNode) => {
+  splitState.textReplacements.forEach((state, textNode) => {
     if (textNode.isConnected && textNode.nodeValue === state.translatedText) {
       textNode.nodeValue = state.originalText;
     }
   });
-  splitTextReplacements.clear();
+  splitState.textReplacements.clear();
 }
 
 function stopSplitMode() {
-  isSplitTargetTranslating = false;
+  runtimeState.isSplitTargetTranslating = false;
   splitState.active = false;
   splitState.role = null;
   splitState.splitId = null;
-  splitState.suppressUntil = 0;
-  splitState.lastSentKey = "";
-  window.clearTimeout(splitState.scrollTimer);
-  window.clearTimeout(splitState.releaseTimer);
-  splitState.scrollTimer = null;
-  splitState.releaseTimer = null;
+  resetSplitScrollTracking();
+  clearSplitReleaseTimer();
 }
 
 function pickRuntimeOptions(currentSettings) {
@@ -1033,19 +1158,19 @@ function safeSendResponse(sendResponse, payload) {
 }
 
 function disableRuntime() {
-  contextAlive = false;
+  runtimeState.contextAlive = false;
   stopTranslationRuntime();
 }
 
 function stopTranslationRuntime() {
-  settings.enabled = false;
+  runtimeState.settings.enabled = false;
   stopAutoMode();
   stopSplitMode();
 }
 
 function isExtensionContextAlive() {
   try {
-    return Boolean(contextAlive && chrome?.runtime?.id);
+    return Boolean(runtimeState.contextAlive && chrome?.runtime?.id);
   } catch {
     return false;
   }

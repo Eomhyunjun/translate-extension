@@ -1,15 +1,6 @@
-const SECRET_DEFAULTS = {
-  openaiApiKey: "",
-  microsoftApiKey: "",
-  zhipuApiKey: "",
-  gptApiKey: "",
-  geminiApiKey: "",
-  claudeApiKey: ""
-};
-
-const PUBLIC_DEFAULTS = {
-  keepTextLogs: false
-};
+const DEFAULT_SETTINGS = globalThis.BIT_DEFAULT_SETTINGS;
+const SECRET_DEFAULTS = globalThis.BIT_SECRET_DEFAULTS;
+const SECRET_SETTING_KEYS = globalThis.BIT_SECRET_SETTING_KEYS;
 
 const keysTab = document.querySelector("#keysTab");
 const logsTab = document.querySelector("#logsTab");
@@ -29,6 +20,19 @@ const resetBtn = document.querySelector("#resetBtn");
 const clearLogsBtn = document.querySelector("#clearLogsBtn");
 const message = document.querySelector("#message");
 
+const LOG_SETTING_DEFAULTS = Object.freeze({
+  keepTextLogs: DEFAULT_SETTINGS.keepTextLogs
+});
+
+const API_KEY_INPUTS = Object.freeze({
+  microsoftApiKey,
+  zhipuApiKey,
+  gptApiKey,
+  geminiApiKey,
+  claudeApiKey,
+  openaiApiKey
+});
+
 init().catch((error) => setMessage(error.message || "초기화에 실패했습니다."));
 
 keysTab.addEventListener("click", () => selectTab("keys"));
@@ -41,55 +45,53 @@ keepTextLogs.addEventListener("change", () => runAction(saveLogSetting));
 async function init() {
   await migrateSecretsToLocal();
   const [secrets, settings] = await Promise.all([
-    chrome.storage.local.get(Object.keys(SECRET_DEFAULTS)),
-    chrome.storage.sync.get(Object.keys(PUBLIC_DEFAULTS))
+    chrome.storage.local.get(SECRET_DEFAULTS),
+    chrome.storage.sync.get(LOG_SETTING_DEFAULTS)
   ]);
-  fillSecrets({ ...SECRET_DEFAULTS, ...secrets });
-  keepTextLogs.checked = settings.keepTextLogs ?? PUBLIC_DEFAULTS.keepTextLogs;
+  fillSecrets(secrets);
+  keepTextLogs.checked = Boolean(settings.keepTextLogs);
   await renderLogs();
 }
 
 async function migrateSecretsToLocal() {
-  const secretKeys = Object.keys(SECRET_DEFAULTS);
-  const legacy = await chrome.storage.sync.get(secretKeys);
+  const legacy = await chrome.storage.sync.get(SECRET_DEFAULTS);
   const nextSecrets = Object.fromEntries(
     Object.entries(legacy).filter(([, value]) => typeof value === "string" && value.length > 0)
   );
+  const legacyKeys = SECRET_SETTING_KEYS.filter((key) => Object.prototype.hasOwnProperty.call(legacy, key));
 
   if (Object.keys(nextSecrets).length > 0) {
     await chrome.storage.local.set(nextSecrets);
   }
-  await chrome.storage.sync.remove(secretKeys);
+  if (legacyKeys.length > 0) {
+    await chrome.storage.sync.remove(legacyKeys);
+  }
 }
 
 function fillSecrets(secrets) {
-  microsoftApiKey.value = secrets.microsoftApiKey;
-  zhipuApiKey.value = secrets.zhipuApiKey;
-  gptApiKey.value = secrets.gptApiKey;
-  geminiApiKey.value = secrets.geminiApiKey;
-  claudeApiKey.value = secrets.claudeApiKey;
-  openaiApiKey.value = secrets.openaiApiKey;
+  Object.entries(API_KEY_INPUTS).forEach(([key, input]) => {
+    input.value = secrets[key] || SECRET_DEFAULTS[key];
+  });
+}
+
+function readSecrets() {
+  return Object.fromEntries(
+    Object.entries(API_KEY_INPUTS).map(([key, input]) => [key, input.value.trim()])
+  );
 }
 
 async function save() {
   await Promise.all([
-    chrome.storage.local.set({
-      microsoftApiKey: microsoftApiKey.value.trim(),
-      zhipuApiKey: zhipuApiKey.value.trim(),
-      gptApiKey: gptApiKey.value.trim(),
-      geminiApiKey: geminiApiKey.value.trim(),
-      claudeApiKey: claudeApiKey.value.trim(),
-      openaiApiKey: openaiApiKey.value.trim()
-    }),
-    chrome.storage.sync.remove(Object.keys(SECRET_DEFAULTS))
+    chrome.storage.local.set(readSecrets()),
+    chrome.storage.sync.remove(SECRET_SETTING_KEYS)
   ]);
   setMessage("API 키를 저장했습니다.");
 }
 
 async function resetKeys() {
   await Promise.all([
-    chrome.storage.local.remove(Object.keys(SECRET_DEFAULTS)),
-    chrome.storage.sync.remove(Object.keys(SECRET_DEFAULTS))
+    chrome.storage.local.remove(SECRET_SETTING_KEYS),
+    chrome.storage.sync.remove(SECRET_SETTING_KEYS)
   ]);
   fillSecrets(SECRET_DEFAULTS);
   setMessage("API 키를 삭제했습니다.");
@@ -185,9 +187,11 @@ function selectTab(tab) {
   const isKeys = tab === "keys";
   keysTab.classList.toggle("active", isKeys);
   logsTab.classList.toggle("active", !isKeys);
+  keysTab.setAttribute("aria-selected", String(isKeys));
+  logsTab.setAttribute("aria-selected", String(!isKeys));
   keysPanel.hidden = !isKeys;
   logsPanel.hidden = isKeys;
-  if (!isKeys) renderLogs();
+  if (!isKeys) renderLogs().catch((error) => setMessage(error.message || "사용 로그를 불러오지 못했습니다."));
 }
 
 function setMessage(text) {

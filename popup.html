@@ -26,7 +26,7 @@
           <option value="gemini">Gemini</option>
           <option value="claude">Claude</option>
           <option value="mymemory">MyMemory 무료 API</option>
-          <option value="openai">OpenAI-compatible API</option>
+          <option value="openai">OpenAI-compatible</option>
         </select>
       </label>
 
@@ -74,12 +74,12 @@
         </label>
 
         <label id="openaiEndpointField" class="field provider-field" data-provider-field="openai">
-          <span>Compatible endpoint</span>
+          <span>OpenAI-compatible endpoint</span>
           <input id="openaiEndpoint" type="url" placeholder="https://api.example.com/v1/chat/completions" />
         </label>
 
         <label id="openaiModelField" class="field provider-field" data-provider-field="openai">
-          <span>Compatible model</span>
+          <span>OpenAI-compatible model</span>
           <input id="openaiModel" type="text" placeholder="provider-specific model" />
         </label>
       </section>
@@ -161,13 +161,14 @@
       </p>
 
       <div class="actions">
-        <button id="translateBtn" class="primary" type="button">적용</button>
-        <button id="clearBtn" type="button">비적용</button>
+        <button id="translateBtn" class="primary" type="button">번역 적용</button>
+        <button id="clearBtn" type="button">번역 제거</button>
       </div>
 
-      <button id="optionsBtn" class="link" type="button">API 키 설정</button>
+      <button id="optionsBtn" class="link" type="button">API 키 및 로그 설정</button>
       <p id="message" class="message" role="status"></p>
     </main>
+    <script src="src/defaults.js"></script>
     <script src="src/popup.js"></script>
   </body>
 </html>
