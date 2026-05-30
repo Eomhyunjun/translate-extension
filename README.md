@@ -8,8 +8,9 @@ Immersive Translate style browser extension prototype. It translates readable pa
 - Paragraph-level bilingual translation
 - Split translation mode: opens the same URL in a paired window and translates that copy in-place
 - Scroll synchronization between the original and translated split windows
-- Popup controls for provider, model, language, display mode, skip behavior, and paragraph batch size
-- Remove translated text from the current page and clear split-view sessions
+- Extension icon click toggles translation on/off for the current tab
+- Right-click extension settings for provider, model, language, display mode, skip behavior, and paragraph batch size
+- Click again to remove translated text from the current page and clear split-view sessions
 - Google Translate provider by default
 - Microsoft Translator, Zhipu BigModel, GPT/OpenAI, Gemini, Claude, MyMemory, and OpenAI-compatible providers
 - API keys stored in `chrome.storage.local`, not synced across browser profiles
@@ -21,11 +22,12 @@ Immersive Translate style browser extension prototype. It translates readable pa
 2. Enable developer mode.
 3. Click "Load unpacked".
 4. Select this project directory.
-5. Open any article page and click the extension icon.
+5. Open any article page and click the extension icon to translate. Click again to remove translations.
+6. Right-click the extension icon and choose settings to configure providers, models, API keys, and logs.
 
 ## Provider setup
 
-The default Google provider uses a public web endpoint and requires no key, but it is best treated as a prototype/testing path. It defaults to English source text; change the source language in the popup when translating other languages.
+The default Google provider uses a public web endpoint and requires no key, but it is best treated as a prototype/testing path. It defaults to English source text; change the source language in the settings page when translating other languages.
 
 Microsoft Translator, Zhipu BigModel, GPT/OpenAI, Gemini, and Claude may have free quotas or free-tier credits depending on the provider, but they still require provider accounts and API keys.
 
@@ -43,7 +45,7 @@ User API keys are stored only in `chrome.storage.local`. They are not stored in 
 
 Browser extensions cannot make user-provided API keys impossible to inspect on the user's own device. For distribution, tell users to create revocable, quota-limited keys for this extension.
 
-For better quality, choose a provider and model from the extension popup. Add API keys from the options page.
+For better quality, choose a provider and model from the extension settings page. Add API keys from the same page.
 
 ## OpenAI-compatible endpoints
 

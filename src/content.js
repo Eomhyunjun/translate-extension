@@ -211,7 +211,10 @@ function handleRuntimeMessage(message, _sender, sendResponse) {
   if (message?.type === "GET_PAGE_STATUS") {
     safeSendResponse(sendResponse, {
       ok: true,
-      translatedCount: document.querySelectorAll(".bit-translation").length + splitState.textReplacements.size
+      translatedCount:
+        document.querySelectorAll(".bit-translation").length +
+        document.querySelectorAll(".bit-replaced").length +
+        splitState.textReplacements.size
     });
     return false;
   }
@@ -461,6 +464,20 @@ function scheduleSplitScrollRelease(releaseAt) {
 }
 
 function getSplitScrollPosition() {
+  const metrics = getSplitScrollMetrics();
+  const anchor = getSplitScrollAnchor();
+
+  return {
+    ...metrics,
+    anchor,
+    anchorKey: anchor?.key || "",
+    anchorOccurrence: anchor?.occurrence ?? -1,
+    anchorViewportTop: anchor?.viewportTop ?? 0,
+    at: Date.now()
+  };
+}
+
+function getSplitScrollMetrics() {
   const scrollingElement = document.scrollingElement || document.documentElement;
   const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
   const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
@@ -483,13 +500,15 @@ function getSplitScrollPosition() {
     viewportWidth,
     viewportHeight,
     documentWidth,
-    documentHeight,
-    at: Date.now()
+    documentHeight
   };
 }
 
 function resolveSplitScrollTarget(scroll) {
-  const current = getSplitScrollPosition();
+  const anchorTarget = resolveSplitAnchorScrollTarget(scroll.anchor || scroll);
+  if (anchorTarget) return anchorTarget;
+
+  const current = getSplitScrollMetrics();
   const ratioX = firstFinite(scroll.ratioX, scroll.xRatio, scroll.leftRatio);
   const ratioY = firstFinite(scroll.ratioY, scroll.yRatio, scroll.topRatio, scroll.ratio);
   const rawX = firstFinite(scroll.x, scroll.scrollX, scroll.left);
@@ -501,6 +520,56 @@ function resolveSplitScrollTarget(scroll) {
   return {
     x: clamp(Math.round(x ?? current.x), 0, current.maxX),
     y: clamp(Math.round(y ?? current.y), 0, current.maxY)
+  };
+}
+
+function getSplitScrollAnchor() {
+  const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+  const preferredTop = Math.min(Math.max(80, viewportHeight * 0.18), viewportHeight * 0.45);
+  const candidates = [];
+
+  collectSplitAnchorUnits().forEach((unit) => {
+    const rect = getTextUnitRect(unit);
+    if (!rect || rect.bottom < 0 || rect.top > viewportHeight) return;
+    candidates.push({
+      unit,
+      rect,
+      score: Math.abs(rect.top - preferredTop)
+    });
+  });
+
+  candidates.sort((a, b) => a.score - b.score || a.rect.top - b.rect.top);
+  const best = candidates[0];
+  if (!best) return null;
+
+  return {
+    key: best.unit.key,
+    occurrence: best.unit.occurrence,
+    viewportTop: clamp(Math.round(best.rect.top), 0, Math.max(0, viewportHeight - 1))
+  };
+}
+
+function resolveSplitAnchorScrollTarget(anchor) {
+  const key = anchor?.key || anchor?.anchorKey;
+  const occurrence = Number(anchor?.occurrence ?? anchor?.anchorOccurrence);
+  if (!key || !Number.isInteger(occurrence)) return null;
+
+  const unit = findSplitAnchorUnit(key, occurrence);
+  if (!unit) return null;
+
+  const rect = getTextUnitRect(unit);
+  if (!rect) return null;
+
+  const current = getSplitScrollMetrics();
+  const desiredViewportTop = clamp(
+    Number(anchor.viewportTop ?? anchor.anchorViewportTop) || 0,
+    0,
+    Math.max(0, current.viewportHeight - 1)
+  );
+
+  return {
+    x: current.x,
+    y: clamp(Math.round(current.y + rect.top - desiredViewportTop), 0, current.maxY)
   };
 }
 
@@ -778,10 +847,58 @@ function collectSplitTextUnits(currentSettings) {
   return units;
 }
 
+function collectSplitAnchorUnits() {
+  if (!document.body) return [];
+
+  const units = [];
+  const occurrenceByKey = new Map();
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      return isSplitAnchorTextNode(node)
+        ? NodeFilter.FILTER_ACCEPT
+        : NodeFilter.FILTER_REJECT;
+    }
+  });
+
+  while (walker.nextNode()) {
+    const unit = createSplitAnchorUnit(walker.currentNode, occurrenceByKey);
+    if (unit) units.push(unit);
+  }
+
+  return units;
+}
+
+function findSplitAnchorUnit(key, occurrence) {
+  const units = collectSplitAnchorUnits();
+  return units.find((unit) => unit.key === key && unit.occurrence === occurrence) || null;
+}
+
 function getSplitTextNodeFilter(node, currentSettings) {
   return isTranslatableSplitTextNode(node, currentSettings)
     ? NodeFilter.FILTER_ACCEPT
     : NodeFilter.FILTER_REJECT;
+}
+
+function isSplitAnchorTextNode(node) {
+  const text = getOriginalTextNodeText(node);
+  if (!isUsefulText(text)) return false;
+
+  const parent = node.parentElement;
+  if (!parent || parent.closest(EXCLUDED_SELECTOR)) return false;
+  if (hasFixedOrStickyAncestor(parent)) return false;
+  if (!isElementVisible(parent)) return false;
+
+  return Boolean(getTextNodeRect(node) || parent.getClientRects().length);
+}
+
+function hasFixedOrStickyAncestor(element) {
+  let current = element;
+  while (current && current !== document.body) {
+    const position = window.getComputedStyle(current).position;
+    if (position === "fixed" || position === "sticky") return true;
+    current = current.parentElement;
+  }
+  return false;
 }
 
 function isTranslatableSplitTextNode(node, currentSettings) {
@@ -808,6 +925,65 @@ function createSplitTextUnit(textNode) {
     element,
     text: normalizeText(textNode.nodeValue || "")
   };
+}
+
+function createSplitAnchorUnit(textNode, occurrenceByKey) {
+  const element = textNode.parentElement;
+  if (!element) return null;
+
+  const text = getOriginalTextNodeText(textNode);
+  const key = makeTextAnchorKey(text);
+  const occurrence = occurrenceByKey.get(key) || 0;
+  occurrenceByKey.set(key, occurrence + 1);
+
+  return {
+    textNode,
+    element,
+    key,
+    occurrence
+  };
+}
+
+function getOriginalTextNodeText(textNode) {
+  const replacement = splitState.textReplacements.get(textNode);
+  return normalizeText(replacement?.originalText || textNode.nodeValue || "");
+}
+
+function makeTextAnchorKey(text) {
+  return `${stableTextHash(text)}:${text.length}`;
+}
+
+function stableTextHash(text) {
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function getTextUnitRect(unit) {
+  return getTextNodeRect(unit.textNode) || getFirstVisibleRect(unit.element);
+}
+
+function getTextNodeRect(textNode) {
+  if (!textNode?.isConnected) return null;
+
+  const range = document.createRange();
+  try {
+    range.selectNodeContents(textNode);
+    return Array.from(range.getClientRects()).find(isUsableRect) || null;
+  } finally {
+    range.detach?.();
+  }
+}
+
+function getFirstVisibleRect(element) {
+  return Array.from(element?.getClientRects?.() || []).find(isUsableRect) || null;
+}
+
+function isUsableRect(rect) {
+  return Boolean(rect && rect.width >= 1 && rect.height >= 1);
 }
 
 function shouldSkipTranslatedText(text, currentSettings) {

@@ -2,10 +2,37 @@ const DEFAULT_SETTINGS = globalThis.BIT_DEFAULT_SETTINGS;
 const SECRET_DEFAULTS = globalThis.BIT_SECRET_DEFAULTS;
 const SECRET_SETTING_KEYS = globalThis.BIT_SECRET_SETTING_KEYS;
 
+const settingsTab = document.querySelector("#settingsTab");
 const keysTab = document.querySelector("#keysTab");
 const logsTab = document.querySelector("#logsTab");
+const settingsPanel = document.querySelector("#settingsPanel");
 const keysPanel = document.querySelector("#keysPanel");
 const logsPanel = document.querySelector("#logsPanel");
+const message = document.querySelector("#message");
+
+const provider = document.querySelector("#provider");
+const providerFields = document.querySelector("#providerFields");
+const microsoftRegion = document.querySelector("#microsoftRegion");
+const zhipuModel = document.querySelector("#zhipuModel");
+const gptModel = document.querySelector("#gptModel");
+const geminiModel = document.querySelector("#geminiModel");
+const claudeModel = document.querySelector("#claudeModel");
+const openaiEndpoint = document.querySelector("#openaiEndpoint");
+const openaiModel = document.querySelector("#openaiModel");
+const sourceLang = document.querySelector("#sourceLang");
+const targetLang = document.querySelector("#targetLang");
+const viewMode = document.querySelector("#viewMode");
+const displayMode = document.querySelector("#displayMode");
+const displayModeField = document.querySelector("#displayModeField");
+const translateScope = document.querySelector("#translateScope");
+const translateScopeField = document.querySelector("#translateScopeField");
+const skipTranslated = document.querySelector("#skipTranslated");
+const batchSize = document.querySelector("#batchSize");
+const batchHelpBtn = document.querySelector("#batchHelpBtn");
+const batchHelp = document.querySelector("#batchHelp");
+const saveSettingsBtn = document.querySelector("#saveSettingsBtn");
+const resetSettingsBtn = document.querySelector("#resetSettingsBtn");
+
 const microsoftApiKey = document.querySelector("#microsoftApiKey");
 const zhipuApiKey = document.querySelector("#zhipuApiKey");
 const gptApiKey = document.querySelector("#gptApiKey");
@@ -18,10 +45,11 @@ const logSummary = document.querySelector("#logSummary");
 const saveBtn = document.querySelector("#saveBtn");
 const resetBtn = document.querySelector("#resetBtn");
 const clearLogsBtn = document.querySelector("#clearLogsBtn");
-const message = document.querySelector("#message");
 
-const LOG_SETTING_DEFAULTS = Object.freeze({
-  keepTextLogs: DEFAULT_SETTINGS.keepTextLogs
+const TAB_CONTROLS = Object.freeze({
+  settings: { tab: settingsTab, panel: settingsPanel },
+  keys: { tab: keysTab, panel: keysPanel },
+  logs: { tab: logsTab, panel: logsPanel }
 });
 
 const API_KEY_INPUTS = Object.freeze({
@@ -33,21 +61,38 @@ const API_KEY_INPUTS = Object.freeze({
   openaiApiKey
 });
 
-init().catch((error) => setMessage(error.message || "초기화에 실패했습니다."));
+const SETTINGS_MESSAGES = Object.freeze({
+  initFailed: "초기화에 실패했습니다.",
+  saveFailed: "설정 저장에 실패했습니다.",
+  saved: "번역 설정을 저장했습니다. 이제 확장 아이콘 클릭으로 바로 적용됩니다.",
+  reset: "번역 설정을 기본값으로 되돌렸습니다.",
+  invalidCompatibleEndpoint: "OpenAI-compatible endpoint는 HTTPS URL이어야 하며 /chat/completions로 끝나야 합니다.",
+  compatibleEndpointDenied: "OpenAI-compatible endpoint 권한이 승인되지 않아 저장하지 않았습니다."
+});
 
+init().catch((error) => setMessage(error.message || SETTINGS_MESSAGES.initFailed));
+
+settingsTab.addEventListener("click", () => selectTab("settings"));
 keysTab.addEventListener("click", () => selectTab("keys"));
 logsTab.addEventListener("click", () => selectTab("logs"));
-saveBtn.addEventListener("click", () => runAction(save));
+saveSettingsBtn.addEventListener("click", () => runAction(savePublicSettings));
+resetSettingsBtn.addEventListener("click", () => runAction(resetPublicSettings));
+saveBtn.addEventListener("click", () => runAction(saveKeys));
 resetBtn.addEventListener("click", () => runAction(resetKeys));
 clearLogsBtn.addEventListener("click", () => runAction(clearLogs));
 keepTextLogs.addEventListener("change", () => runAction(saveLogSetting));
+provider.addEventListener("change", syncProviderFields);
+viewMode.addEventListener("change", syncViewModeFields);
+batchHelpBtn.addEventListener("click", toggleBatchHelp);
 
 async function init() {
   await migrateSecretsToLocal();
   const [secrets, settings] = await Promise.all([
     chrome.storage.local.get(SECRET_DEFAULTS),
-    chrome.storage.sync.get(LOG_SETTING_DEFAULTS)
+    chrome.storage.sync.get(DEFAULT_SETTINGS)
   ]);
+
+  fillPublicSettings(settings);
   fillSecrets(secrets);
   keepTextLogs.checked = Boolean(settings.keepTextLogs);
   await renderLogs();
@@ -68,10 +113,50 @@ async function migrateSecretsToLocal() {
   }
 }
 
+function fillPublicSettings(settings) {
+  provider.value = settings.provider || DEFAULT_SETTINGS.provider;
+  microsoftRegion.value = settings.microsoftRegion || DEFAULT_SETTINGS.microsoftRegion;
+  zhipuModel.value = settings.zhipuModel || DEFAULT_SETTINGS.zhipuModel;
+  gptModel.value = settings.gptModel || DEFAULT_SETTINGS.gptModel;
+  geminiModel.value = settings.geminiModel || DEFAULT_SETTINGS.geminiModel;
+  claudeModel.value = settings.claudeModel || DEFAULT_SETTINGS.claudeModel;
+  openaiEndpoint.value = settings.openaiEndpoint || DEFAULT_SETTINGS.openaiEndpoint;
+  openaiModel.value = settings.openaiModel || DEFAULT_SETTINGS.openaiModel;
+  sourceLang.value = settings.sourceLang || DEFAULT_SETTINGS.sourceLang;
+  targetLang.value = settings.targetLang || DEFAULT_SETTINGS.targetLang;
+  viewMode.value = normalizeViewMode(settings.viewMode);
+  displayMode.value = settings.displayMode || DEFAULT_SETTINGS.displayMode;
+  translateScope.value = settings.translateScope || DEFAULT_SETTINGS.translateScope;
+  skipTranslated.checked = settings.skipTranslated !== false;
+  batchSize.value = clamp(Number(settings.batchSize) || DEFAULT_SETTINGS.batchSize, 1, 20);
+  syncProviderFields();
+  syncViewModeFields();
+}
+
 function fillSecrets(secrets) {
   Object.entries(API_KEY_INPUTS).forEach(([key, input]) => {
     input.value = secrets[key] || SECRET_DEFAULTS[key];
   });
+}
+
+function readPublicSettings() {
+  return {
+    provider: provider.value,
+    microsoftRegion: microsoftRegion.value.trim(),
+    zhipuModel: zhipuModel.value,
+    gptModel: gptModel.value,
+    geminiModel: geminiModel.value,
+    claudeModel: claudeModel.value,
+    openaiEndpoint: openaiEndpoint.value.trim() || DEFAULT_SETTINGS.openaiEndpoint,
+    openaiModel: openaiModel.value.trim() || DEFAULT_SETTINGS.openaiModel,
+    sourceLang: sourceLang.value,
+    targetLang: targetLang.value,
+    viewMode: normalizeViewMode(viewMode.value),
+    displayMode: displayMode.value,
+    translateScope: translateScope.value,
+    skipTranslated: skipTranslated.checked,
+    batchSize: clamp(Number(batchSize.value) || DEFAULT_SETTINGS.batchSize, 1, 20)
+  };
 }
 
 function readSecrets() {
@@ -80,7 +165,26 @@ function readSecrets() {
   );
 }
 
-async function save() {
+async function savePublicSettings() {
+  const nextSettings = readPublicSettings();
+  await ensureEndpointPermission(nextSettings);
+  await chrome.storage.sync.set(nextSettings);
+  setMessage(SETTINGS_MESSAGES.saved);
+}
+
+async function resetPublicSettings() {
+  const defaults = readPublicDefaults();
+  await chrome.storage.sync.set(defaults);
+  fillPublicSettings(DEFAULT_SETTINGS);
+  setMessage(SETTINGS_MESSAGES.reset);
+}
+
+function readPublicDefaults() {
+  const { keepTextLogs: _keepTextLogs, ...publicDefaults } = DEFAULT_SETTINGS;
+  return publicDefaults;
+}
+
+async function saveKeys() {
   await Promise.all([
     chrome.storage.local.set(readSecrets()),
     chrome.storage.sync.remove(SECRET_SETTING_KEYS)
@@ -167,6 +271,81 @@ function renderPreview(label, values) {
   return preview;
 }
 
+function syncProviderFields() {
+  const activeProvider = provider.value;
+  let visibleCount = 0;
+
+  document.querySelectorAll(".provider-field").forEach((field) => {
+    const isVisible = field.dataset.providerField === activeProvider;
+    field.hidden = !isVisible;
+    if (isVisible) visibleCount += 1;
+  });
+
+  providerFields.hidden = visibleCount === 0;
+}
+
+function syncViewModeFields() {
+  const isSplit = normalizeViewMode(viewMode.value) === "split";
+  [displayMode, translateScope].forEach((control) => {
+    control.disabled = isSplit;
+  });
+  [displayModeField, translateScopeField].forEach((field) => {
+    field.classList.toggle("disabled", isSplit);
+  });
+}
+
+function toggleBatchHelp() {
+  const nextExpanded = batchHelp.hidden;
+  batchHelp.hidden = !nextExpanded;
+  batchHelpBtn.setAttribute("aria-expanded", String(nextExpanded));
+}
+
+async function ensureEndpointPermission(nextSettings) {
+  if (nextSettings.provider !== "openai") return;
+
+  const url = parseOpenAICompatibleEndpoint(nextSettings.openaiEndpoint);
+  if (url.hostname === "api.openai.com") return;
+
+  const origin = `${url.origin}/*`;
+  const hasPermission = await chrome.permissions.contains({ origins: [origin] });
+  if (hasPermission) return;
+
+  const granted = await chrome.permissions.request({ origins: [origin] });
+  if (!granted) {
+    throw new Error(SETTINGS_MESSAGES.compatibleEndpointDenied);
+  }
+}
+
+function parseOpenAICompatibleEndpoint(value) {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.username || url.password || !url.pathname.endsWith("/chat/completions")) {
+      throw new Error();
+    }
+    return url;
+  } catch {
+    throw new Error(SETTINGS_MESSAGES.invalidCompatibleEndpoint);
+  }
+}
+
+function selectTab(activeTab) {
+  Object.entries(TAB_CONTROLS).forEach(([name, controls]) => {
+    const isActive = name === activeTab;
+    controls.tab.classList.toggle("active", isActive);
+    controls.tab.setAttribute("aria-selected", String(isActive));
+    controls.panel.hidden = !isActive;
+  });
+
+  if (activeTab === "logs") {
+    renderLogs().catch((error) => setMessage(error.message || "사용 로그를 불러오지 못했습니다."));
+  }
+}
+
+function normalizeViewMode(value) {
+  if (value === "panel" || value === "split") return "split";
+  return "inline";
+}
+
 function formatTokens(actual, estimated) {
   if (actual != null) return `${actual.toLocaleString()} tokens`;
   return `~${Number(estimated || 0).toLocaleString()} tokens`;
@@ -183,17 +362,6 @@ function formatDate(value) {
   }).format(new Date(value));
 }
 
-function selectTab(tab) {
-  const isKeys = tab === "keys";
-  keysTab.classList.toggle("active", isKeys);
-  logsTab.classList.toggle("active", !isKeys);
-  keysTab.setAttribute("aria-selected", String(isKeys));
-  logsTab.setAttribute("aria-selected", String(!isKeys));
-  keysPanel.hidden = !isKeys;
-  logsPanel.hidden = isKeys;
-  if (!isKeys) renderLogs().catch((error) => setMessage(error.message || "사용 로그를 불러오지 못했습니다."));
-}
-
 function setMessage(text) {
   message.textContent = text;
 }
@@ -202,6 +370,10 @@ async function runAction(action) {
   try {
     await action();
   } catch (error) {
-    setMessage(error.message || "작업에 실패했습니다.");
+    setMessage(error.message || SETTINGS_MESSAGES.saveFailed);
   }
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
 }

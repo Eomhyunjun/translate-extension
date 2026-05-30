@@ -4,6 +4,7 @@ const DEFAULT_SETTINGS = globalThis.BIT_DEFAULT_SETTINGS;
 const SECRET_DEFAULTS = globalThis.BIT_SECRET_DEFAULTS;
 
 let logWriteQueue = Promise.resolve();
+const ACTION_CONTEXT_MENU_SETTINGS_ID = "bit-open-settings";
 const SPLIT_SESSIONS_STORAGE_KEY = "splitSessions";
 const SPLIT_SCROLL_ECHO_WINDOW_MS = 700;
 const SPLIT_SCROLL_LOOSE_ECHO_WINDOW_MS = 180;
@@ -91,7 +92,10 @@ const SPLIT_SCROLL_SIGNATURE_KEYS = [
   "xRatio",
   "scrollRatio",
   "progress",
-  "percent"
+  "percent",
+  "anchorKey",
+  "anchorOccurrence",
+  "anchorViewportTop"
 ];
 
 const SPLIT_SCROLL_VOLATILE_KEYS = new Set([
@@ -114,15 +118,35 @@ chrome.runtime.onInstalled.addListener(async () => {
   await chrome.storage.sync.set({ ...DEFAULT_SETTINGS, ...stored });
   await chrome.storage.sync.remove("enabled");
   await migrateSecretsToLocal();
+  await setupActionContextMenu();
 });
 
 chrome.runtime.onStartup.addListener(() => {
   migrateSecretsToLocal();
+  setupActionContextMenu().catch(() => {});
+});
+
+setupActionContextMenu().catch(() => {});
+
+chrome.action.onClicked.addListener((tab) => {
+  toggleTranslationForTab(tab).catch((error) => {
+    updateActionError(tab?.id, sanitizeError(error)).catch(() => {});
+  });
+});
+
+chrome.contextMenus.onClicked.addListener((info) => {
+  if (info.menuItemId === ACTION_CONTEXT_MENU_SETTINGS_ID) {
+    chrome.runtime.openOptionsPage();
+  }
 });
 
 chrome.runtime.onMessage.addListener(routeRuntimeMessage);
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status === "loading") {
+    updateActionIdle(tabId).catch(() => {});
+    return;
+  }
   if (changeInfo.status !== "complete") return;
   activatePendingSplitTarget(tabId).catch(() => {});
 });
@@ -159,6 +183,123 @@ function handleClearSplitSessionMessage(message) {
 async function handleTranslateBatchMessage(message) {
   const translations = await translateBatch(normalizeTexts(message.texts), sanitizeOptions(message.options));
   return { translations };
+}
+
+async function setupActionContextMenu() {
+  await removeActionContextMenu();
+  await new Promise((resolve, reject) => {
+    chrome.contextMenus.create({
+      id: ACTION_CONTEXT_MENU_SETTINGS_ID,
+      title: "상세 설정 열기",
+      contexts: ["action"]
+    }, () => {
+      const error = chrome.runtime.lastError;
+      if (!error || String(error.message).includes("duplicate id")) {
+        resolve();
+        return;
+      }
+      reject(error);
+    });
+  });
+}
+
+function removeActionContextMenu() {
+  return new Promise((resolve) => {
+    chrome.contextMenus.remove(ACTION_CONTEXT_MENU_SETTINGS_ID, () => {
+      void chrome.runtime.lastError;
+      resolve();
+    });
+  });
+}
+
+async function toggleTranslationForTab(tab) {
+  if (!tab?.id) throw new Error("활성 탭을 찾을 수 없습니다.");
+  if (!isSupportedPageUrl(tab.url)) {
+    throw new Error("이 페이지에서는 확장을 실행할 수 없습니다.");
+  }
+
+  await ensureSplitSessionsLoaded();
+  const splitSession = splitSessionsByTab.get(tab.id);
+  const status = await getTabTranslationStatus(tab.id);
+  const hasVisibleTranslation = Number(status?.translatedCount || 0) > 0;
+
+  if (splitSession || hasVisibleTranslation) {
+    await clearTranslationsForTab(tab.id);
+    await updateActionIdle(tab.id);
+    return;
+  }
+
+  const settings = await getActionRuntimeSettings();
+  await startTranslationForTab(tab.id, settings);
+  await updateActionEnabled(tab.id);
+}
+
+async function getActionRuntimeSettings() {
+  const stored = await chrome.storage.sync.get(DEFAULT_SETTINGS);
+  return normalizeActionRuntimeSettings(stored);
+}
+
+function normalizeActionRuntimeSettings(stored = {}) {
+  const input = { ...DEFAULT_SETTINGS, ...stored };
+  const safe = { ...DEFAULT_SETTINGS, ...sanitizeSettings(input) };
+
+  safe.viewMode = input.viewMode === "split" || input.viewMode === "panel" ? "split" : "inline";
+  safe.displayMode = ALLOWED_SPLIT_DISPLAY_MODES.has(input.displayMode) ? input.displayMode : DEFAULT_SETTINGS.displayMode;
+  safe.translateScope = ALLOWED_SPLIT_SCOPES.has(input.translateScope) ? input.translateScope : DEFAULT_SETTINGS.translateScope;
+  safe.skipTranslated = typeof input.skipTranslated === "boolean" ? input.skipTranslated : DEFAULT_SETTINGS.skipTranslated;
+  safe.batchSize = clamp(Number(input.batchSize) || DEFAULT_SETTINGS.batchSize, 1, 20);
+  safe.enabled = true;
+
+  return safe;
+}
+
+async function startTranslationForTab(tabId, settings) {
+  if (settings.viewMode === "split") {
+    const response = await startSplitMode({ tabId, options: { ...settings, translateScope: "viewport" } }, {});
+    return { ok: true, ...response };
+  }
+
+  const response = await chrome.tabs.sendMessage(tabId, {
+    type: "TRANSLATE_PAGE",
+    options: settings
+  });
+  if (!response?.ok) throw new Error(response?.error || "번역을 완료하지 못했습니다.");
+  return response;
+}
+
+async function clearTranslationsForTab(tabId) {
+  await Promise.allSettled([
+    chrome.tabs.sendMessage(tabId, { type: "CLEAR_TRANSLATIONS" }),
+    clearSplitSession(tabId)
+  ]);
+}
+
+async function getTabTranslationStatus(tabId) {
+  return chrome.tabs.sendMessage(tabId, { type: "GET_PAGE_STATUS" }).catch(() => null);
+}
+
+async function updateActionEnabled(tabId) {
+  await Promise.allSettled([
+    chrome.action.setBadgeText({ tabId, text: "ON" }),
+    chrome.action.setBadgeBackgroundColor({ tabId, color: "#2563eb" }),
+    chrome.action.setTitle({ tabId, title: "번역 켜짐 - 클릭하면 해제" })
+  ]);
+}
+
+async function updateActionIdle(tabId) {
+  await Promise.allSettled([
+    chrome.action.setBadgeText({ tabId, text: "" }),
+    chrome.action.setTitle({ tabId, title: "Bilingual Translator - 클릭하면 번역" })
+  ]);
+}
+
+async function updateActionError(tabId, title) {
+  if (!Number.isInteger(tabId)) return;
+  await Promise.allSettled([
+    chrome.action.setBadgeText({ tabId, text: "!" }),
+    chrome.action.setBadgeBackgroundColor({ tabId, color: "#dc2626" }),
+    chrome.action.setTitle({ tabId, title: title || "번역 실행 실패" })
+  ]);
 }
 
 async function startSplitMode(message, sender) {
