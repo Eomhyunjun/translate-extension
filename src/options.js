@@ -278,10 +278,15 @@ function syncProviderFields() {
   document.querySelectorAll(".provider-field").forEach((field) => {
     const isVisible = field.dataset.providerField === activeProvider;
     field.hidden = !isVisible;
+    field.setAttribute("aria-hidden", String(!isVisible));
+    field.querySelectorAll("input, select, textarea, button").forEach((control) => {
+      control.disabled = !isVisible;
+    });
     if (isVisible) visibleCount += 1;
   });
 
   providerFields.hidden = visibleCount === 0;
+  providerFields.setAttribute("aria-hidden", String(visibleCount === 0));
 }
 
 function syncViewModeFields() {

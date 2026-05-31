@@ -9,6 +9,10 @@ body {
   background: #f8fafc;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 .settings {
   max-width: 820px;
   margin: 0 auto;

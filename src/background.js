@@ -14,14 +14,12 @@ let splitSessionsReady = null;
 let secretsMigrationReady = null;
 
 const MESSAGE_TYPES = {
-  START_SPLIT_MODE: "START_SPLIT_MODE",
   CLEAR_SPLIT_SESSION: "CLEAR_SPLIT_SESSION",
   SPLIT_SCROLL: "SPLIT_SCROLL",
   TRANSLATE_BATCH: "TRANSLATE_BATCH"
 };
 
 const RUNTIME_MESSAGE_HANDLERS = {
-  [MESSAGE_TYPES.START_SPLIT_MODE]: startSplitMode,
   [MESSAGE_TYPES.CLEAR_SPLIT_SESSION]: handleClearSplitSessionMessage,
   [MESSAGE_TYPES.SPLIT_SCROLL]: relaySplitScroll,
   [MESSAGE_TYPES.TRANSLATE_BATCH]: handleTranslateBatchMessage
@@ -95,7 +93,8 @@ const SPLIT_SCROLL_SIGNATURE_KEYS = [
   "percent",
   "anchorKey",
   "anchorOccurrence",
-  "anchorViewportTop"
+  "anchorViewportTop",
+  "containerKey"
 ];
 
 const SPLIT_SCROLL_VOLATILE_KEYS = new Set([
@@ -128,12 +127,6 @@ chrome.runtime.onStartup.addListener(() => {
 
 setupActionContextMenu().catch(() => {});
 
-chrome.action.onClicked.addListener((tab) => {
-  toggleTranslationForTab(tab).catch((error) => {
-    updateActionError(tab?.id, sanitizeError(error)).catch(() => {});
-  });
-});
-
 chrome.contextMenus.onClicked.addListener((info) => {
   if (info.menuItemId === ACTION_CONTEXT_MENU_SETTINGS_ID) {
     chrome.runtime.openOptionsPage();
@@ -143,10 +136,6 @@ chrome.contextMenus.onClicked.addListener((info) => {
 chrome.runtime.onMessage.addListener(routeRuntimeMessage);
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (changeInfo.status === "loading") {
-    updateActionIdle(tabId).catch(() => {});
-    return;
-  }
   if (changeInfo.status !== "complete") return;
   activatePendingSplitTarget(tabId).catch(() => {});
 });
@@ -212,114 +201,8 @@ function removeActionContextMenu() {
   });
 }
 
-async function toggleTranslationForTab(tab) {
-  if (!tab?.id) throw new Error("활성 탭을 찾을 수 없습니다.");
-  if (!isSupportedPageUrl(tab.url)) {
-    throw new Error("이 페이지에서는 확장을 실행할 수 없습니다.");
-  }
-
-  await ensureSplitSessionsLoaded();
-  const splitSession = splitSessionsByTab.get(tab.id);
-  const status = await getTabTranslationStatus(tab.id);
-  const hasVisibleTranslation = Number(status?.translatedCount || 0) > 0;
-
-  if (splitSession || hasVisibleTranslation) {
-    await clearTranslationsForTab(tab.id);
-    await updateActionIdle(tab.id);
-    return;
-  }
-
-  const settings = await getActionRuntimeSettings();
-  await startTranslationForTab(tab.id, settings);
-  await updateActionEnabled(tab.id);
-}
-
-async function getActionRuntimeSettings() {
-  const stored = await chrome.storage.sync.get(DEFAULT_SETTINGS);
-  return normalizeActionRuntimeSettings(stored);
-}
-
-function normalizeActionRuntimeSettings(stored = {}) {
-  const input = { ...DEFAULT_SETTINGS, ...stored };
-  const safe = { ...DEFAULT_SETTINGS, ...sanitizeSettings(input) };
-
-  safe.viewMode = input.viewMode === "split" || input.viewMode === "panel" ? "split" : "inline";
-  safe.displayMode = ALLOWED_SPLIT_DISPLAY_MODES.has(input.displayMode) ? input.displayMode : DEFAULT_SETTINGS.displayMode;
-  safe.translateScope = ALLOWED_SPLIT_SCOPES.has(input.translateScope) ? input.translateScope : DEFAULT_SETTINGS.translateScope;
-  safe.skipTranslated = typeof input.skipTranslated === "boolean" ? input.skipTranslated : DEFAULT_SETTINGS.skipTranslated;
-  safe.batchSize = clamp(Number(input.batchSize) || DEFAULT_SETTINGS.batchSize, 1, 20);
-  safe.enabled = true;
-
-  return safe;
-}
-
-async function startTranslationForTab(tabId, settings) {
-  if (settings.viewMode === "split") {
-    const response = await startSplitMode({ tabId, options: { ...settings, translateScope: "viewport" } }, {});
-    return { ok: true, ...response };
-  }
-
-  const response = await chrome.tabs.sendMessage(tabId, {
-    type: "TRANSLATE_PAGE",
-    options: settings
-  });
-  if (!response?.ok) throw new Error(response?.error || "번역을 완료하지 못했습니다.");
-  return response;
-}
-
-async function clearTranslationsForTab(tabId) {
-  await Promise.allSettled([
-    chrome.tabs.sendMessage(tabId, { type: "CLEAR_TRANSLATIONS" }),
-    clearSplitSession(tabId)
-  ]);
-}
-
-async function getTabTranslationStatus(tabId) {
-  return chrome.tabs.sendMessage(tabId, { type: "GET_PAGE_STATUS" }).catch(() => null);
-}
-
-async function updateActionEnabled(tabId) {
-  await Promise.allSettled([
-    chrome.action.setBadgeText({ tabId, text: "ON" }),
-    chrome.action.setBadgeBackgroundColor({ tabId, color: "#2563eb" }),
-    chrome.action.setTitle({ tabId, title: "번역 켜짐 - 클릭하면 해제" })
-  ]);
-}
-
-async function updateActionIdle(tabId) {
-  await Promise.allSettled([
-    chrome.action.setBadgeText({ tabId, text: "" }),
-    chrome.action.setTitle({ tabId, title: "Bilingual Translator - 클릭하면 번역" })
-  ]);
-}
-
-async function updateActionError(tabId, title) {
-  if (!Number.isInteger(tabId)) return;
-  await Promise.allSettled([
-    chrome.action.setBadgeText({ tabId, text: "!" }),
-    chrome.action.setBadgeBackgroundColor({ tabId, color: "#dc2626" }),
-    chrome.action.setTitle({ tabId, title: title || "번역 실행 실패" })
-  ]);
-}
-
 async function startSplitMode(message, sender) {
-  const sourceTabId = getSplitSourceTabId(message, sender);
-  if (!Number.isInteger(sourceTabId)) throw new Error("Source tab is missing.");
-
-  await ensureSplitSessionsLoaded();
-  await clearSplitSession(sourceTabId);
-
-  const sourceTab = await getSupportedSplitSourceTab(sourceTabId);
-  const rawOptions = getSplitRawOptions(message);
-  const splitOptions = sanitizeSplitOptions(rawOptions);
-  const targetTab = await createSplitTargetTab(sourceTab, rawOptions);
-  const session = createSplitSession(sourceTabId, sourceTab, targetTab, splitOptions);
-
-  await registerSplitSession(session);
-  notifySplitSource(session);
-  activateSplitTargetWhenReady(session, targetTab);
-
-  return buildSplitStartedResponse(session);
+  throw new Error("Legacy split-window mode is disabled. Use in-page split mode.");
 }
 
 function getSplitSourceTabId(message, sender) {
@@ -384,50 +267,6 @@ function buildSplitStartedResponse(session) {
     targetTabId: session.targetTabId,
     targetWindowId: session.targetWindowId
   };
-}
-
-async function createSplitTargetTab(sourceTab, options = {}) {
-  if (options.openInWindow === false || options.target === "tab") {
-    const createProperties = {
-      url: sourceTab.url,
-      active: getSplitTargetActiveState(options),
-      windowId: sourceTab.windowId
-    };
-    if (Number.isInteger(sourceTab.index)) createProperties.index = sourceTab.index + 1;
-    if (Number.isInteger(sourceTab.id)) createProperties.openerTabId = sourceTab.id;
-    return chrome.tabs.create(createProperties);
-  }
-
-  const sourceWindow = await chrome.windows.get(sourceTab.windowId).catch(() => null);
-  const createData = {
-    url: sourceTab.url,
-    focused: getSplitTargetActiveState(options),
-    type: "normal"
-  };
-
-  if (sourceWindow && Number.isInteger(sourceWindow.left) && Number.isInteger(sourceWindow.width)) {
-    const width = Math.max(520, Math.floor(sourceWindow.width / 2));
-    const height = Math.max(520, sourceWindow.height || 720);
-    createData.left = sourceWindow.left + width;
-    createData.top = sourceWindow.top || 0;
-    createData.width = width;
-    createData.height = height;
-
-    chrome.windows.update(sourceWindow.id, {
-      left: sourceWindow.left,
-      top: sourceWindow.top || 0,
-      width,
-      height
-    }).catch(() => {});
-  }
-
-  const targetWindow = await chrome.windows.create(createData);
-  const tabs = targetWindow.tabs?.length
-    ? targetWindow.tabs
-    : await chrome.tabs.query({ windowId: targetWindow.id, active: true });
-  const [targetTab] = tabs;
-  if (!targetTab?.id) throw new Error("Failed to create translated split tab.");
-  return targetTab;
 }
 
 async function activatePendingSplitTarget(tabId) {

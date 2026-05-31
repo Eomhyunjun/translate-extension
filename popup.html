@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Bilingual Translator</title>
+    <link rel="stylesheet" href="src/popup.css" />
+  </head>
+  <body>
+    <main class="popup">
+      <header>
+        <h1>번역 실행</h1>
+      </header>
+
+      <label class="field">
+        <span>번역 엔진</span>
+        <select id="provider">
+          <option value="google">Google Translate</option>
+          <option value="microsoft">Microsoft Translator</option>
+          <option value="zhipu">Zhipu BigModel</option>
+          <option value="gpt">GPT / OpenAI</option>
+          <option value="gemini">Gemini</option>
+          <option value="claude">Claude</option>
+          <option value="mymemory">MyMemory 무료 API</option>
+          <option value="openai">OpenAI-compatible</option>
+        </select>
+      </label>
+
+      <section id="providerFields" class="provider-fields" hidden>
+        <label class="field provider-field" data-provider-field="zhipu">
+          <span>모델</span>
+          <select id="zhipuModel">
+            <option value="glm-4-flash">glm-4-flash</option>
+            <option value="glm-4-air">glm-4-air</option>
+            <option value="glm-4-plus">glm-4-plus</option>
+          </select>
+        </label>
+
+        <label class="field provider-field" data-provider-field="gpt">
+          <span>모델</span>
+          <select id="gptModel">
+            <option value="gpt-4.1-mini">gpt-4.1-mini</option>
+            <option value="gpt-4.1">gpt-4.1</option>
+            <option value="gpt-4o-mini">gpt-4o-mini</option>
+            <option value="gpt-4o">gpt-4o</option>
+          </select>
+        </label>
+
+        <label class="field provider-field" data-provider-field="gemini">
+          <span>모델</span>
+          <select id="geminiModel">
+            <option value="gemini-2.0-flash">gemini-2.0-flash</option>
+            <option value="gemini-1.5-flash">gemini-1.5-flash</option>
+            <option value="gemini-1.5-pro">gemini-1.5-pro</option>
+          </select>
+        </label>
+
+        <label class="field provider-field" data-provider-field="claude">
+          <span>모델</span>
+          <select id="claudeModel">
+            <option value="claude-3-5-haiku-latest">claude-3-5-haiku-latest</option>
+            <option value="claude-3-5-sonnet-latest">claude-3-5-sonnet-latest</option>
+            <option value="claude-3-7-sonnet-latest">claude-3-7-sonnet-latest</option>
+          </select>
+        </label>
+
+        <label class="field provider-field" data-provider-field="openai">
+          <span>모델</span>
+          <input id="openaiModel" type="text" placeholder="provider-specific model" />
+        </label>
+      </section>
+
+      <div class="grid-two">
+        <label class="field">
+          <span>원문 언어</span>
+          <select id="sourceLang">
+            <option value="en">English</option>
+            <option value="auto">자동 감지</option>
+            <option value="ko">한국어</option>
+            <option value="ja">日本語</option>
+            <option value="zh-CN">简体中文</option>
+            <option value="zh-TW">繁體中文</option>
+            <option value="es">Español</option>
+            <option value="fr">Français</option>
+            <option value="de">Deutsch</option>
+          </select>
+        </label>
+
+        <label class="field">
+          <span>번역 언어</span>
+          <select id="targetLang">
+            <option value="ko">한국어</option>
+            <option value="en">English</option>
+            <option value="ja">日本語</option>
+            <option value="zh-CN">简体中文</option>
+            <option value="zh-TW">繁體中文</option>
+            <option value="es">Español</option>
+            <option value="fr">Français</option>
+            <option value="de">Deutsch</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="mode-actions" aria-label="보기 모드">
+        <button id="inlineBtn" class="primary" type="button">인라인 보기</button>
+        <button id="splitBtn" class="primary" type="button">좌우 분할 보기</button>
+      </div>
+
+      <button id="clearBtn" class="secondary" type="button">번역 제거</button>
+      <p id="message" class="message" role="status"></p>
+    </main>
+    <script src="src/defaults.js"></script>
+    <script src="src/popup.js"></script>
+  </body>
+</html>

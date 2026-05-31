@@ -97,8 +97,27 @@ const splitState = {
   releaseTimer: null,
   suppressUntil: 0,
   lastSentKey: "",
+  lastScrollElement: null,
+  lastScrollAt: 0,
   translationCache: new Map(),
   textReplacements: new Map()
+};
+const mirrorState = {
+  active: false,
+  root: null,
+  sourceFrame: null,
+  targetFrame: null,
+  sourceWindow: null,
+  targetWindow: null,
+  sourceDocument: null,
+  targetDocument: null,
+  translateTimer: null,
+  suppressScrollUntil: 0,
+  originalOverflow: "",
+  originalBodyOverflow: "",
+  translationCache: new Map(),
+  textReplacements: new Map(),
+  cleanupHandlers: []
 };
 
 if (typeof window.__bitTranslatorCleanup === "function") {
@@ -174,6 +193,13 @@ function handleRuntimeMessage(message, _sender, sendResponse) {
     return true;
   }
 
+  if (message?.type === "START_IN_PAGE_SPLIT") {
+    startInPageSplit(message.options || {})
+      .then((result) => safeSendResponse(sendResponse, { ok: true, ...result }))
+      .catch((error) => safeSendResponse(sendResponse, { ok: false, error: error.message || "In-page split failed" }));
+    return true;
+  }
+
   if (message?.type === "START_SPLIT_SOURCE") {
     startSplitSource(message)
       .then((result) => safeSendResponse(sendResponse, { ok: true, ...result }))
@@ -214,7 +240,9 @@ function handleRuntimeMessage(message, _sender, sendResponse) {
       translatedCount:
         document.querySelectorAll(".bit-translation").length +
         document.querySelectorAll(".bit-replaced").length +
-        splitState.textReplacements.size
+        splitState.textReplacements.size +
+        mirrorState.textReplacements.size +
+        (mirrorState.active ? 1 : 0)
     });
     return false;
   }
@@ -238,6 +266,8 @@ function mergeRuntimeSettings(overrides) {
 
 async function translatePage(overrides = {}) {
   if (!runtimeState.contextAlive) return { translatedCount: 0, skippedCount: 0 };
+  if (overrides.viewMode === "split") return startInPageSplit(overrides);
+
   const runId = cancelActiveTranslations();
   mergeRuntimeSettings(overrides);
   if (!overrides.auto) stopSplitMode();
@@ -285,6 +315,430 @@ async function translatePage(overrides = {}) {
   return { translatedCount, skippedCount: blocks.length - translatedCount };
 }
 
+async function startInPageSplit(overrides = {}) {
+  if (!runtimeState.contextAlive) return { translatedCount: 0, skippedCount: 0 };
+
+  const runId = cancelActiveTranslations();
+  mergeRuntimeSettings({ ...overrides, viewMode: "split", translateScope: "viewport", enabled: true });
+  stopAutoMode();
+  stopSplitMode();
+  clearTranslations({ keepMirror: true });
+  stopMirrorMode();
+
+  const snapshot = createMirrorSnapshotHtml();
+  const root = createMirrorRoot();
+  document.documentElement.style.overflow = "hidden";
+  document.body.style.overflow = "hidden";
+  document.body.appendChild(root);
+
+  const sourceFrame = root.querySelector(".bit-mirror-frame-source");
+  const targetFrame = root.querySelector(".bit-mirror-frame-target");
+  mirrorState.active = true;
+  mirrorState.root = root;
+  mirrorState.sourceFrame = sourceFrame;
+  mirrorState.targetFrame = targetFrame;
+  const sourceReady = waitForFrameLoad(sourceFrame);
+  const targetReady = waitForFrameLoad(targetFrame);
+  sourceFrame.srcdoc = snapshot;
+  targetFrame.srcdoc = snapshot;
+
+  await Promise.all([sourceReady, targetReady]);
+  if (!isActiveRun(runId) || !mirrorState.active) return { translatedCount: 0, skippedCount: 0 };
+
+  mirrorState.sourceWindow = sourceFrame.contentWindow;
+  mirrorState.targetWindow = targetFrame.contentWindow;
+  mirrorState.sourceDocument = sourceFrame.contentDocument;
+  mirrorState.targetDocument = targetFrame.contentDocument;
+  setupMirrorScrollSync();
+
+  const result = await translateMirrorViewport({ runId });
+  return result;
+}
+
+function createMirrorRoot() {
+  mirrorState.originalOverflow = document.documentElement.style.overflow;
+  mirrorState.originalBodyOverflow = document.body.style.overflow;
+
+  const root = document.createElement("div");
+  root.className = "bit-mirror-root";
+  root.innerHTML = `
+    <div class="bit-mirror-toolbar">
+      <strong>분할 번역</strong>
+      <span>왼쪽은 원문, 오른쪽은 번역입니다.</span>
+      <button class="bit-mirror-close" type="button" aria-label="분할 번역 닫기">닫기</button>
+    </div>
+    <div class="bit-mirror-grid">
+      <iframe class="bit-mirror-frame bit-mirror-frame-source" title="원문"></iframe>
+      <iframe class="bit-mirror-frame bit-mirror-frame-target" title="번역"></iframe>
+    </div>
+  `;
+
+  root.querySelector(".bit-mirror-close").addEventListener("click", () => {
+    cancelActiveTranslations();
+    stopMirrorMode();
+  });
+
+  return root;
+}
+
+function createMirrorSnapshotHtml() {
+  const clone = document.documentElement.cloneNode(true);
+  sanitizeMirrorSnapshot(clone);
+  ensureMirrorBaseElement(clone);
+  injectMirrorSnapshotStyles(clone);
+  return `<!doctype html>\n${clone.outerHTML}`;
+}
+
+function sanitizeMirrorSnapshot(root) {
+  root.querySelectorAll("script, noscript, iframe, object, embed, .bit-mirror-root, .bit-translation").forEach((node) => node.remove());
+  root.querySelectorAll(".bit-pending, .bit-failed, .bit-replaced").forEach((node) => {
+    node.classList.remove("bit-pending", "bit-failed", "bit-replaced");
+    node.removeAttribute("data-bit-error");
+    node.removeAttribute("data-bit-translated-text");
+    node.removeAttribute("data-bit-original-text");
+  });
+  root.querySelectorAll("*").forEach((element) => {
+    Array.from(element.attributes).forEach((attribute) => {
+      const name = attribute.name.toLowerCase();
+      if (name.startsWith("on") || name === "srcdoc") element.removeAttribute(attribute.name);
+    });
+  });
+}
+
+function ensureMirrorBaseElement(root) {
+  const head = root.querySelector("head") || root.insertBefore(document.createElement("head"), root.firstChild);
+  head.querySelectorAll("base").forEach((node) => node.remove());
+  const base = document.createElement("base");
+  base.href = window.location.href;
+  head.prepend(base);
+}
+
+function injectMirrorSnapshotStyles(root) {
+  const head = root.querySelector("head");
+  if (!head) return;
+  const style = document.createElement("style");
+  style.textContent = `
+    html, body { min-height: 100%; }
+    .bit-mirror-translated-text { outline: 1px solid rgba(37, 99, 235, 0.2); outline-offset: 1px; }
+  `;
+  head.appendChild(style);
+}
+
+function waitForFrameLoad(frame) {
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(new Error("분할 화면을 불러오지 못했습니다.")), 5000);
+    frame.addEventListener("load", () => {
+      window.clearTimeout(timer);
+      resolve();
+    }, { once: true });
+  });
+}
+
+function setupMirrorScrollSync() {
+  addMirrorFrameScrollListener(mirrorState.sourceWindow, mirrorState.targetWindow);
+  addMirrorFrameScrollListener(mirrorState.targetWindow, mirrorState.sourceWindow);
+  scheduleMirrorTranslation();
+}
+
+function addMirrorFrameScrollListener(fromWindow, toWindow) {
+  if (!fromWindow || !toWindow) return;
+
+  const onScroll = () => {
+    if (!mirrorState.active || Date.now() < mirrorState.suppressScrollUntil) return;
+    syncMirrorScroll(fromWindow, toWindow);
+    scheduleMirrorTranslation();
+  };
+  fromWindow.addEventListener("scroll", onScroll, { passive: true });
+  mirrorState.cleanupHandlers.push(() => fromWindow.removeEventListener("scroll", onScroll));
+}
+
+function syncMirrorScroll(fromWindow, toWindow) {
+  const fromDocument = fromWindow.document;
+  const toDocument = toWindow.document;
+  const anchor = getMirrorScrollAnchor(fromWindow, fromDocument);
+  const target = anchor ? resolveMirrorAnchorTarget(anchor, toWindow, toDocument) : null;
+
+  beginMirrorScrollSuppression();
+  if (target) {
+    toWindow.scrollTo({ left: target.x, top: target.y, behavior: "auto" });
+  } else {
+    syncMirrorScrollByRatio(fromWindow, toWindow);
+  }
+}
+
+function beginMirrorScrollSuppression() {
+  mirrorState.suppressScrollUntil = Date.now() + SPLIT_SCROLL_SUPPRESS_MS;
+}
+
+function syncMirrorScrollByRatio(fromWindow, toWindow) {
+  const fromMaxY = getFrameMaxScrollY(fromWindow);
+  const toMaxY = getFrameMaxScrollY(toWindow);
+  const ratioY = fromMaxY > 0 ? fromWindow.scrollY / fromMaxY : 0;
+  toWindow.scrollTo({
+    left: toWindow.scrollX,
+    top: clamp(Math.round(ratioY * toMaxY), 0, toMaxY),
+    behavior: "auto"
+  });
+}
+
+function getFrameMaxScrollY(frameWindow) {
+  const scrollingElement = frameWindow.document.scrollingElement || frameWindow.document.documentElement;
+  return Math.max(0, scrollingElement.scrollHeight - frameWindow.innerHeight);
+}
+
+function getMirrorScrollAnchor(frameWindow, frameDocument) {
+  const viewportHeight = frameWindow.innerHeight || frameDocument.documentElement.clientHeight || 0;
+  const preferredTop = Math.min(Math.max(80, viewportHeight * 0.18), viewportHeight * 0.45);
+  const candidates = [];
+
+  collectMirrorAnchorUnits(frameDocument).forEach((unit) => {
+    const rect = getTextUnitRect(unit);
+    if (!rect || rect.bottom < 0 || rect.top > viewportHeight) return;
+    candidates.push({
+      unit,
+      rect,
+      score: Math.abs(rect.top - preferredTop)
+    });
+  });
+
+  candidates.sort((a, b) => a.score - b.score || a.rect.top - b.rect.top);
+  const best = candidates[0];
+  if (!best) return null;
+
+  return {
+    key: best.unit.key,
+    occurrence: best.unit.occurrence,
+    viewportTop: clamp(Math.round(best.rect.top), 0, Math.max(0, viewportHeight - 1))
+  };
+}
+
+function resolveMirrorAnchorTarget(anchor, frameWindow, frameDocument) {
+  const unit = findMirrorAnchorUnit(frameDocument, anchor.key, anchor.occurrence);
+  if (!unit) return null;
+
+  const rect = getTextUnitRect(unit);
+  if (!rect) return null;
+
+  const maxY = getFrameMaxScrollY(frameWindow);
+  return {
+    x: frameWindow.scrollX || 0,
+    y: clamp(Math.round((frameWindow.scrollY || 0) + rect.top - anchor.viewportTop), 0, maxY)
+  };
+}
+
+function scheduleMirrorTranslation() {
+  window.clearTimeout(mirrorState.translateTimer);
+  mirrorState.translateTimer = window.setTimeout(() => {
+    translateMirrorViewport({ runId: runtimeState.activeRun }).catch((error) => {
+      if (!isContextInvalidatedError(error)) console.warn("Mirror translation failed", error);
+    });
+  }, 260);
+}
+
+async function translateMirrorViewport({ runId = runtimeState.activeRun } = {}) {
+  if (!mirrorState.active || !mirrorState.targetDocument || !isActiveRun(runId)) {
+    return { translatedCount: 0, skippedCount: 0 };
+  }
+
+  const units = collectMirrorTextUnits(mirrorState.targetDocument, runtimeState.settings).slice(0, 60);
+  if (units.length === 0) return { translatedCount: 0, skippedCount: 0 };
+
+  const { translatedCount, missingGroups } = collectMissingMirrorTranslationGroups(units, runtimeState.settings);
+  let nextTranslatedCount = translatedCount;
+  const batchSize = getTranslationBatchSize(runtimeState.settings);
+
+  for (let index = 0; index < missingGroups.length; index += batchSize) {
+    if (!isActiveRun(runId) || !mirrorState.active) break;
+
+    const batch = missingGroups.slice(index, index + batchSize);
+    const response = await sendRuntimeMessage({
+      type: "TRANSLATE_BATCH",
+      texts: batch.map((group) => group.text),
+      options: pickRuntimeOptions(runtimeState.settings)
+    });
+
+    if (!response) return { translatedCount: nextTranslatedCount, skippedCount: units.length - nextTranslatedCount };
+    if (!response.ok) throw new Error(response?.error || "Mirror translation failed");
+
+    response.translations.forEach((translation, offset) => {
+      const group = batch[offset];
+      if (!group || !translation || !isActiveRun(runId)) return;
+      const normalizedTranslation = String(translation);
+      mirrorState.translationCache.set(group.key, normalizedTranslation);
+      nextTranslatedCount += replaceMirrorTextUnits(group.units, normalizedTranslation);
+    });
+  }
+
+  return { translatedCount: nextTranslatedCount, skippedCount: units.length - nextTranslatedCount };
+}
+
+function collectMirrorTextUnits(frameDocument, currentSettings) {
+  const units = [];
+  const walker = frameDocument.createTreeWalker(frameDocument.body, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (!isTranslatableMirrorTextNode(node, frameDocument.defaultView, currentSettings)) {
+        return NodeFilter.FILTER_REJECT;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    }
+  });
+
+  while (walker.nextNode()) {
+    const unit = createMirrorTextUnit(walker.currentNode);
+    if (unit) units.push(unit);
+  }
+
+  return units;
+}
+
+function collectMirrorAnchorUnits(frameDocument) {
+  const units = [];
+  const occurrenceByKey = new Map();
+  const walker = frameDocument.createTreeWalker(frameDocument.body, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (!isMirrorAnchorTextNode(node, frameDocument.defaultView)) return NodeFilter.FILTER_REJECT;
+      return NodeFilter.FILTER_ACCEPT;
+    }
+  });
+
+  while (walker.nextNode()) {
+    const unit = createMirrorAnchorUnit(walker.currentNode, occurrenceByKey);
+    if (unit) units.push(unit);
+  }
+
+  return units;
+}
+
+function findMirrorAnchorUnit(frameDocument, key, occurrence) {
+  return collectMirrorAnchorUnits(frameDocument).find((unit) => (
+    unit.key === key && unit.occurrence === occurrence
+  )) || null;
+}
+
+function isTranslatableMirrorTextNode(node, frameWindow, currentSettings) {
+  if (mirrorState.textReplacements.has(node)) return false;
+
+  const text = normalizeText(node.nodeValue || "");
+  if (!isUsefulText(text)) return false;
+  if (shouldSkipTranslatedText(text, currentSettings)) return false;
+  if (!isValidMirrorTextParent(node.parentElement, frameWindow)) return false;
+  if (!isMirrorElementInViewport(node.parentElement, frameWindow)) return false;
+
+  return true;
+}
+
+function isMirrorAnchorTextNode(node, frameWindow) {
+  const text = getMirrorOriginalTextNodeText(node);
+  if (!isUsefulText(text)) return false;
+  return isValidMirrorTextParent(node.parentElement, frameWindow);
+}
+
+function isValidMirrorTextParent(parent, frameWindow) {
+  if (!parent || parent.closest(EXCLUDED_SELECTOR)) return false;
+
+  const style = frameWindow.getComputedStyle(parent);
+  if (
+    style.display === "none" ||
+    style.visibility === "hidden" ||
+    style.visibility === "collapse" ||
+    Number(style.opacity) === 0
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+function isMirrorElementInViewport(element, frameWindow) {
+  if (!element) return false;
+  const rects = Array.from(element.getClientRects()).filter((rect) => rect.width >= 1 && rect.height >= 1);
+  if (rects.length === 0) return false;
+
+  const viewportHeight = frameWindow.innerHeight || frameWindow.document.documentElement.clientHeight || 0;
+  const viewportWidth = frameWindow.innerWidth || frameWindow.document.documentElement.clientWidth || 0;
+  const verticalPadding = viewportHeight * 0.2;
+
+  return rects.some((rect) => (
+    rect.bottom >= -verticalPadding &&
+    rect.top <= viewportHeight + verticalPadding &&
+    rect.right >= 0 &&
+    rect.left <= viewportWidth
+  ));
+}
+
+function createMirrorTextUnit(textNode) {
+  const element = textNode.parentElement;
+  if (!element) return null;
+  return {
+    textNode,
+    element,
+    text: normalizeText(textNode.nodeValue || "")
+  };
+}
+
+function createMirrorAnchorUnit(textNode, occurrenceByKey) {
+  const element = textNode.parentElement;
+  if (!element) return null;
+
+  const text = getMirrorOriginalTextNodeText(textNode);
+  const key = makeTextAnchorKey(text);
+  const occurrence = occurrenceByKey.get(key) || 0;
+  occurrenceByKey.set(key, occurrence + 1);
+
+  return {
+    textNode,
+    element,
+    key,
+    occurrence
+  };
+}
+
+function getMirrorOriginalTextNodeText(textNode) {
+  const replacement = mirrorState.textReplacements.get(textNode);
+  return normalizeText(replacement?.originalText || textNode.nodeValue || "");
+}
+
+function collectMissingMirrorTranslationGroups(units, currentSettings) {
+  let translatedCount = 0;
+  const missingGroups = [];
+  const groups = groupDuplicateTextItems(units, {
+    bucketName: "units",
+    getKey: (unit) => splitCacheKey(unit.text, currentSettings),
+    getText: (unit) => unit.text
+  });
+
+  groups.forEach((group) => {
+    const cachedTranslation = mirrorState.translationCache.get(group.key);
+    if (cachedTranslation) {
+      translatedCount += replaceMirrorTextUnits(group.units, cachedTranslation);
+      return;
+    }
+
+    missingGroups.push(group);
+  });
+
+  return { translatedCount, missingGroups };
+}
+
+function replaceMirrorTextUnits(units, translation) {
+  return units.reduce((count, unit) => (
+    replaceMirrorTextUnit(unit, translation) ? count + 1 : count
+  ), 0);
+}
+
+function replaceMirrorTextUnit(unit, translation) {
+  const textNode = unit.textNode;
+  if (!textNode?.isConnected || mirrorState.textReplacements.has(textNode)) return false;
+  if (normalizeText(textNode.nodeValue || "") !== unit.text) return false;
+
+  const originalText = textNode.nodeValue || "";
+  const translatedText = preserveTextNodeSpacing(originalText, translation);
+  mirrorState.textReplacements.set(textNode, { originalText, translatedText });
+  textNode.nodeValue = translatedText;
+  unit.element.classList?.add("bit-mirror-translated-text");
+  return true;
+}
+
 async function startSplitSource(message = {}) {
   const options = getMessageOptions(message);
   cancelActiveTranslations();
@@ -330,7 +784,8 @@ function scheduleAutoTranslate() {
   }, 350);
 }
 
-function handlePossibleViewportChange() {
+function handlePossibleViewportChange(event) {
+  rememberSplitScrollElement(event);
   if (
     runtimeState.contextAlive &&
     runtimeState.settings.enabled &&
@@ -376,10 +831,10 @@ function applySplitScroll(message) {
   const target = resolveSplitScrollTarget(incoming);
   if (!target) return;
 
-  if (isNearScrollTarget(getWindowScrollPoint(), target)) return;
+  if (isNearScrollTarget(getCurrentScrollPoint(target), target)) return;
 
   const releaseAt = beginSplitScrollSuppression();
-  window.scrollTo({ left: target.x, top: target.y, behavior: "auto" });
+  applyResolvedSplitScrollTarget(target);
   scheduleSplitScrollRelease(releaseAt);
 
   if (runtimeState.settings.enabled && runtimeState.settings.translateScope === "viewport") scheduleAutoTranslate();
@@ -396,6 +851,8 @@ function isSplitScrollSuppressed() {
 function resetSplitScrollTracking() {
   splitState.suppressUntil = 0;
   splitState.lastSentKey = "";
+  splitState.lastScrollElement = null;
+  splitState.lastScrollAt = 0;
   clearSplitScrollTimer();
 }
 
@@ -411,6 +868,7 @@ function clearSplitReleaseTimer() {
 
 function getSplitScrollKey(scroll) {
   return [
+    scroll.containerKey || "window",
     Math.round(scroll.x),
     Math.round(scroll.y),
     Math.round(scroll.maxX),
@@ -445,6 +903,27 @@ function getWindowScrollPoint() {
   };
 }
 
+function getCurrentScrollPoint(target = {}) {
+  const box = resolveSplitScrollBox(target.containerKey);
+  if (box.element) {
+    return {
+      x: box.element.scrollLeft || 0,
+      y: box.element.scrollTop || 0
+    };
+  }
+  return getWindowScrollPoint();
+}
+
+function applyResolvedSplitScrollTarget(target) {
+  const box = resolveSplitScrollBox(target.containerKey);
+  if (box.element) {
+    box.element.scrollLeft = target.x;
+    box.element.scrollTop = target.y;
+    return;
+  }
+  window.scrollTo({ left: target.x, top: target.y, behavior: "auto" });
+}
+
 function isNearScrollTarget(current, target) {
   return Math.abs(current.x - target.x) < 2 && Math.abs(current.y - target.y) < 2;
 }
@@ -463,9 +942,109 @@ function scheduleSplitScrollRelease(releaseAt) {
   }, SPLIT_SCROLL_SUPPRESS_MS);
 }
 
+function rememberSplitScrollElement(event) {
+  if (!splitState.active || !event?.target) return;
+  const element = normalizeScrollEventTarget(event.target);
+  if (!element || !isScrollableElement(element)) return;
+
+  splitState.lastScrollElement = element;
+  splitState.lastScrollAt = Date.now();
+}
+
+function normalizeScrollEventTarget(target) {
+  if (target === document || target === window) return document.scrollingElement || document.documentElement;
+  if (target === document.body || target === document.documentElement) return document.scrollingElement || document.documentElement;
+  return target instanceof Element ? target : null;
+}
+
+function resolveSplitScrollBox(containerKey) {
+  let element = null;
+  if (containerKey && containerKey !== "window") {
+    element = findElementByDomPath(containerKey);
+  } else if (!containerKey) {
+    element = getActiveSplitScrollElement();
+  }
+
+  if (element && !isDocumentScrollElement(element) && isScrollableElement(element)) {
+    return {
+      key: getElementDomPath(element),
+      element,
+      scrollLeft: element.scrollLeft || 0,
+      scrollTop: element.scrollTop || 0,
+      scrollWidth: Math.max(element.scrollWidth, element.clientWidth),
+      scrollHeight: Math.max(element.scrollHeight, element.clientHeight),
+      viewportWidth: element.clientWidth || 0,
+      viewportHeight: element.clientHeight || 0
+    };
+  }
+
+  const scrollingElement = document.scrollingElement || document.documentElement;
+  const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+  const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+  return {
+    key: "window",
+    element: null,
+    scrollLeft: window.scrollX || scrollingElement.scrollLeft || 0,
+    scrollTop: window.scrollY || scrollingElement.scrollTop || 0,
+    scrollWidth: Math.max(scrollingElement.scrollWidth, document.documentElement.scrollWidth, document.body?.scrollWidth || 0),
+    scrollHeight: Math.max(scrollingElement.scrollHeight, document.documentElement.scrollHeight, document.body?.scrollHeight || 0),
+    viewportWidth,
+    viewportHeight
+  };
+}
+
+function getActiveSplitScrollElement() {
+  if (
+    splitState.lastScrollElement?.isConnected &&
+    Date.now() - splitState.lastScrollAt < 1200 &&
+    isScrollableElement(splitState.lastScrollElement)
+  ) {
+    return splitState.lastScrollElement;
+  }
+
+  return document.scrollingElement || document.documentElement;
+}
+
+function isDocumentScrollElement(element) {
+  return element === document.scrollingElement || element === document.documentElement || element === document.body;
+}
+
+function isScrollableElement(element) {
+  if (!element) return false;
+  const maxX = Math.max(0, element.scrollWidth - element.clientWidth);
+  const maxY = Math.max(0, element.scrollHeight - element.clientHeight);
+  return maxX > 1 || maxY > 1;
+}
+
+function getElementDomPath(element) {
+  if (!element || isDocumentScrollElement(element)) return "window";
+
+  const parts = [];
+  let current = element;
+  while (current && current !== document.body && current !== document.documentElement) {
+    const parent = current.parentElement;
+    if (!parent) break;
+
+    const index = Array.prototype.indexOf.call(parent.children, current) + 1;
+    parts.push(`${current.tagName.toLowerCase()}:nth-child(${index})`);
+    current = parent;
+  }
+
+  return parts.length ? `body>${parts.reverse().join(">")}` : "window";
+}
+
+function findElementByDomPath(path) {
+  if (!path || path === "window") return null;
+  try {
+    return document.querySelector(path);
+  } catch {
+    return null;
+  }
+}
+
 function getSplitScrollPosition() {
   const metrics = getSplitScrollMetrics();
-  const anchor = getSplitScrollAnchor();
+  const anchor = getSplitScrollAnchor(metrics);
 
   return {
     ...metrics,
@@ -473,20 +1052,21 @@ function getSplitScrollPosition() {
     anchorKey: anchor?.key || "",
     anchorOccurrence: anchor?.occurrence ?? -1,
     anchorViewportTop: anchor?.viewportTop ?? 0,
+    containerKey: metrics.containerKey,
     at: Date.now()
   };
 }
 
-function getSplitScrollMetrics() {
-  const scrollingElement = document.scrollingElement || document.documentElement;
-  const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
-  const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
-  const documentWidth = Math.max(scrollingElement.scrollWidth, document.documentElement.scrollWidth, document.body?.scrollWidth || 0);
-  const documentHeight = Math.max(scrollingElement.scrollHeight, document.documentElement.scrollHeight, document.body?.scrollHeight || 0);
+function getSplitScrollMetrics(containerKey) {
+  const box = resolveSplitScrollBox(containerKey);
+  const viewportWidth = box.viewportWidth;
+  const viewportHeight = box.viewportHeight;
+  const documentWidth = box.scrollWidth;
+  const documentHeight = box.scrollHeight;
   const maxX = Math.max(0, documentWidth - viewportWidth);
   const maxY = Math.max(0, documentHeight - viewportHeight);
-  const x = window.scrollX || scrollingElement.scrollLeft || 0;
-  const y = window.scrollY || scrollingElement.scrollTop || 0;
+  const x = box.scrollLeft;
+  const y = box.scrollTop;
 
   return {
     x,
@@ -500,7 +1080,8 @@ function getSplitScrollMetrics() {
     viewportWidth,
     viewportHeight,
     documentWidth,
-    documentHeight
+    documentHeight,
+    containerKey: box.key
   };
 }
 
@@ -508,7 +1089,7 @@ function resolveSplitScrollTarget(scroll) {
   const anchorTarget = resolveSplitAnchorScrollTarget(scroll.anchor || scroll);
   if (anchorTarget) return anchorTarget;
 
-  const current = getSplitScrollMetrics();
+  const current = getSplitScrollMetrics(scroll.containerKey);
   const ratioX = firstFinite(scroll.ratioX, scroll.xRatio, scroll.leftRatio);
   const ratioY = firstFinite(scroll.ratioY, scroll.yRatio, scroll.topRatio, scroll.ratio);
   const rawX = firstFinite(scroll.x, scroll.scrollX, scroll.left);
@@ -518,12 +1099,13 @@ function resolveSplitScrollTarget(scroll) {
 
   if (x === null && y === null) return null;
   return {
+    containerKey: current.containerKey,
     x: clamp(Math.round(x ?? current.x), 0, current.maxX),
     y: clamp(Math.round(y ?? current.y), 0, current.maxY)
   };
 }
 
-function getSplitScrollAnchor() {
+function getSplitScrollAnchor(metrics = getSplitScrollMetrics()) {
   const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
   const preferredTop = Math.min(Math.max(80, viewportHeight * 0.18), viewportHeight * 0.45);
   const candidates = [];
@@ -545,6 +1127,7 @@ function getSplitScrollAnchor() {
   return {
     key: best.unit.key,
     occurrence: best.unit.occurrence,
+    containerKey: metrics.containerKey,
     viewportTop: clamp(Math.round(best.rect.top), 0, Math.max(0, viewportHeight - 1))
   };
 }
@@ -560,7 +1143,7 @@ function resolveSplitAnchorScrollTarget(anchor) {
   const rect = getTextUnitRect(unit);
   if (!rect) return null;
 
-  const current = getSplitScrollMetrics();
+  const current = getSplitScrollMetrics(anchor.containerKey);
   const desiredViewportTop = clamp(
     Number(anchor.viewportTop ?? anchor.anchorViewportTop) || 0,
     0,
@@ -568,6 +1151,7 @@ function resolveSplitAnchorScrollTarget(anchor) {
   );
 
   return {
+    containerKey: current.containerKey,
     x: current.x,
     y: clamp(Math.round(current.y + rect.top - desiredViewportTop), 0, current.maxY)
   };
@@ -969,7 +1553,7 @@ function getTextUnitRect(unit) {
 function getTextNodeRect(textNode) {
   if (!textNode?.isConnected) return null;
 
-  const range = document.createRange();
+  const range = textNode.ownerDocument.createRange();
   try {
     range.selectNodeContents(textNode);
     return Array.from(range.getClientRects()).find(isUsableRect) || null;
@@ -1241,6 +1825,7 @@ function markFailed(batch, message) {
 function clearTranslations(options = {}) {
   splitState.translationCache.clear();
   runtimeState.lastViewportSignature = "";
+  if (!options.keepMirror) stopMirrorMode();
   if (!options.keepSplit) stopSplitMode();
   restoreSplitTextReplacements();
   document.querySelectorAll(".bit-translation").forEach((node) => node.remove());
@@ -1267,6 +1852,40 @@ function restoreSplitTextReplacements() {
     }
   });
   splitState.textReplacements.clear();
+}
+
+function stopMirrorMode() {
+  if (!mirrorState.active && !mirrorState.root) return;
+
+  window.clearTimeout(mirrorState.translateTimer);
+  mirrorState.translateTimer = null;
+
+  while (mirrorState.cleanupHandlers.length > 0) {
+    const cleanup = mirrorState.cleanupHandlers.pop();
+    try {
+      cleanup();
+    } catch {
+      // Best effort cleanup for iframe listeners.
+    }
+  }
+
+  mirrorState.root?.remove();
+  mirrorState.active = false;
+  mirrorState.root = null;
+  mirrorState.sourceFrame = null;
+  mirrorState.targetFrame = null;
+  mirrorState.sourceWindow = null;
+  mirrorState.targetWindow = null;
+  mirrorState.sourceDocument = null;
+  mirrorState.targetDocument = null;
+  mirrorState.suppressScrollUntil = 0;
+  mirrorState.originalOverflow = "";
+  mirrorState.originalBodyOverflow = "";
+  mirrorState.translationCache.clear();
+  mirrorState.textReplacements.clear();
+
+  document.documentElement.style.overflow = mirrorState.originalOverflow;
+  document.body.style.overflow = mirrorState.originalBodyOverflow;
 }
 
 function stopSplitMode() {
@@ -1341,6 +1960,7 @@ function disableRuntime() {
 function stopTranslationRuntime() {
   runtimeState.settings.enabled = false;
   stopAutoMode();
+  stopMirrorMode();
   stopSplitMode();
 }
 

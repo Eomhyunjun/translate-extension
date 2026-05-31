@@ -1,16 +1,17 @@
 # Bilingual Immersive Translator
 
-Immersive Translate style browser extension prototype. It translates readable page blocks inline, and can also open a translated split view that keeps the original page layout while replacing visible text in the translated window.
+Immersive Translate style browser extension prototype. It translates readable page blocks inline, and can also open an in-page split view that mirrors the current HTML and replaces visible text on the translated side.
 
 ## Features
 
 - Chrome/Edge Manifest V3 extension
 - Paragraph-level bilingual translation
-- Split translation mode: opens the same URL in a paired window and translates that copy in-place
-- Scroll synchronization between the original and translated split windows
-- Extension icon click toggles translation on/off for the current tab
+- Split translation mode: mirrors the current page inside the same tab with a 1:1 grid
+- Scroll synchronization between the original and translated panes
+- Extension icon click opens a compact popup for provider/model/language selection
 - Right-click extension settings for provider, model, language, display mode, skip behavior, and paragraph batch size
-- Click again to remove translated text from the current page and clear split-view sessions
+- Popup buttons start inline translation or same-tab split translation immediately
+- Popup translation removal clears translated text and closes split view
 - Google Translate provider by default
 - Microsoft Translator, Zhipu BigModel, GPT/OpenAI, Gemini, Claude, MyMemory, and OpenAI-compatible providers
 - API keys stored in `chrome.storage.local`, not synced across browser profiles
