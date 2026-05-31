@@ -31,7 +31,7 @@
     "48": "assets/icon-48.png",
     "128": "assets/icon-128.png"
   },
-  "permissions": ["activeTab", "contextMenus", "storage", "tabs"],
+  "permissions": ["activeTab", "contextMenus", "scripting", "storage", "tabs"],
   "host_permissions": [
     "https://translate.googleapis.com/*",
     "https://api.mymemory.translated.net/*",

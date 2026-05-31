@@ -20,7 +20,7 @@ const POPUP_MESSAGES = Object.freeze({
   pageUnavailable: "현재 페이지에서 실행할 수 없습니다.",
   translateBusy: "번역 중...",
   clearBusy: "번역 제거 중...",
-  tabScriptMissing: "현재 탭에 확장 스크립트가 준비되지 않았습니다. 페이지를 새로고침한 뒤 다시 시도하세요.",
+  tabScriptUnavailable: "현재 탭에 확장 스크립트를 주입할 수 없습니다. 일반 웹페이지에서 다시 시도하세요.",
   invalidCompatibleEndpoint: "OpenAI-compatible endpoint는 HTTPS URL이어야 하며 /chat/completions로 끝나야 합니다.",
   compatibleEndpointDenied: "OpenAI-compatible endpoint 권한이 승인되지 않아 저장하지 않았습니다."
 });
@@ -162,7 +162,15 @@ async function sendTabMessage(tabId, payload) {
   try {
     return await chrome.tabs.sendMessage(tabId, payload);
   } catch (error) {
-    if (isTransientExtensionError(error)) throw new Error(POPUP_MESSAGES.tabScriptMissing);
+    if (!isTransientExtensionError(error)) throw error;
+  }
+
+  await injectContentScript(tabId);
+
+  try {
+    return await chrome.tabs.sendMessage(tabId, payload);
+  } catch (error) {
+    if (isTransientExtensionError(error)) throw new Error(POPUP_MESSAGES.tabScriptUnavailable);
     throw error;
   }
 }
@@ -191,6 +199,30 @@ function isTransientExtensionError(error) {
     text.includes("message channel closed") ||
     text.includes("message port closed")
   );
+}
+
+async function injectContentScript(tabId) {
+  const tab = await chrome.tabs.get(tabId);
+  if (!isSupportedPageUrl(tab?.url)) {
+    throw new Error(POPUP_MESSAGES.pageUnavailable);
+  }
+
+  try {
+    await chrome.scripting.insertCSS({
+      target: { tabId },
+      files: ["src/content.css"]
+    });
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["src/defaults.js", "src/content.js"]
+    });
+  } catch (error) {
+    throw new Error(error?.message || POPUP_MESSAGES.tabScriptUnavailable);
+  }
+}
+
+function isSupportedPageUrl(url) {
+  return /^(https?|file):\/\//i.test(String(url || ""));
 }
 
 async function ensureEndpointPermission(nextSettings) {

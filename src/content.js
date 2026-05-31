@@ -1,3 +1,4 @@
+(() => {
 const DEFAULT_SETTINGS = globalThis.BIT_DEFAULT_SETTINGS;
 
 const BLOCK_SELECTOR = [
@@ -112,7 +113,11 @@ const mirrorState = {
   sourceDocument: null,
   targetDocument: null,
   translateTimer: null,
+  viewportWatchTimer: null,
   suppressScrollUntil: 0,
+  isTranslating: false,
+  needsTranslation: false,
+  lastViewportSignature: "",
   originalOverflow: "",
   originalBodyOverflow: "",
   translationCache: new Map(),
@@ -437,19 +442,40 @@ function waitForFrameLoad(frame) {
 function setupMirrorScrollSync() {
   addMirrorFrameScrollListener(mirrorState.sourceWindow, mirrorState.targetWindow);
   addMirrorFrameScrollListener(mirrorState.targetWindow, mirrorState.sourceWindow);
-  scheduleMirrorTranslation();
+  startMirrorViewportWatcher();
+  scheduleMirrorTranslation(0);
 }
 
 function addMirrorFrameScrollListener(fromWindow, toWindow) {
   if (!fromWindow || !toWindow) return;
 
   const onScroll = () => {
-    if (!mirrorState.active || Date.now() < mirrorState.suppressScrollUntil) return;
-    syncMirrorScroll(fromWindow, toWindow);
-    scheduleMirrorTranslation();
+    if (!mirrorState.active) return;
+    if (Date.now() >= mirrorState.suppressScrollUntil) {
+      syncMirrorScroll(fromWindow, toWindow);
+    }
+    scheduleMirrorTranslation(90);
   };
+
+  const onViewportInput = () => {
+    if (!mirrorState.active) return;
+    scheduleMirrorTranslation(120);
+  };
+
   fromWindow.addEventListener("scroll", onScroll, { passive: true });
+  fromWindow.document?.addEventListener("scroll", onScroll, { passive: true, capture: true });
+  fromWindow.addEventListener("wheel", onViewportInput, { passive: true });
+  fromWindow.addEventListener("touchmove", onViewportInput, { passive: true });
+  fromWindow.addEventListener("touchend", onViewportInput, { passive: true });
+  fromWindow.addEventListener("keyup", onViewportInput);
+  fromWindow.addEventListener("resize", onViewportInput, { passive: true });
   mirrorState.cleanupHandlers.push(() => fromWindow.removeEventListener("scroll", onScroll));
+  mirrorState.cleanupHandlers.push(() => fromWindow.document?.removeEventListener("scroll", onScroll, { capture: true }));
+  mirrorState.cleanupHandlers.push(() => fromWindow.removeEventListener("wheel", onViewportInput));
+  mirrorState.cleanupHandlers.push(() => fromWindow.removeEventListener("touchmove", onViewportInput));
+  mirrorState.cleanupHandlers.push(() => fromWindow.removeEventListener("touchend", onViewportInput));
+  mirrorState.cleanupHandlers.push(() => fromWindow.removeEventListener("keyup", onViewportInput));
+  mirrorState.cleanupHandlers.push(() => fromWindow.removeEventListener("resize", onViewportInput));
 }
 
 function syncMirrorScroll(fromWindow, toWindow) {
@@ -526,54 +552,98 @@ function resolveMirrorAnchorTarget(anchor, frameWindow, frameDocument) {
   };
 }
 
-function scheduleMirrorTranslation() {
+function startMirrorViewportWatcher() {
+  stopMirrorViewportWatcher();
+  mirrorState.lastViewportSignature = getMirrorViewportSignature();
+  mirrorState.viewportWatchTimer = window.setInterval(() => {
+    if (!mirrorState.active) return;
+    const signature = getMirrorViewportSignature();
+    if (!signature || signature === mirrorState.lastViewportSignature) return;
+    mirrorState.lastViewportSignature = signature;
+    scheduleMirrorTranslation(80);
+  }, 500);
+}
+
+function stopMirrorViewportWatcher() {
+  window.clearInterval(mirrorState.viewportWatchTimer);
+  mirrorState.viewportWatchTimer = null;
+}
+
+function getMirrorViewportSignature() {
+  if (!mirrorState.active || !mirrorState.targetDocument || !mirrorState.targetWindow) return "";
+  return collectMirrorAnchorUnits(mirrorState.targetDocument)
+    .filter((unit) => isMirrorElementInViewport(unit.element, mirrorState.targetWindow))
+    .slice(0, 40)
+    .map((unit) => `${unit.key}:${unit.occurrence}`)
+    .join("|");
+}
+
+function scheduleMirrorTranslation(delayMs = 160) {
   window.clearTimeout(mirrorState.translateTimer);
   mirrorState.translateTimer = window.setTimeout(() => {
     translateMirrorViewport({ runId: runtimeState.activeRun }).catch((error) => {
       if (!isContextInvalidatedError(error)) console.warn("Mirror translation failed", error);
     });
-  }, 260);
+  }, delayMs);
 }
 
 async function translateMirrorViewport({ runId = runtimeState.activeRun } = {}) {
   if (!mirrorState.active || !mirrorState.targetDocument || !isActiveRun(runId)) {
     return { translatedCount: 0, skippedCount: 0 };
   }
-
-  const units = collectMirrorTextUnits(mirrorState.targetDocument, runtimeState.settings).slice(0, 60);
-  if (units.length === 0) return { translatedCount: 0, skippedCount: 0 };
-
-  const { translatedCount, missingGroups } = collectMissingMirrorTranslationGroups(units, runtimeState.settings);
-  let nextTranslatedCount = translatedCount;
-  const batchSize = getTranslationBatchSize(runtimeState.settings);
-
-  for (let index = 0; index < missingGroups.length; index += batchSize) {
-    if (!isActiveRun(runId) || !mirrorState.active) break;
-
-    const batch = missingGroups.slice(index, index + batchSize);
-    const response = await sendRuntimeMessage({
-      type: "TRANSLATE_BATCH",
-      texts: batch.map((group) => group.text),
-      options: pickRuntimeOptions(runtimeState.settings)
-    });
-
-    if (!response) return { translatedCount: nextTranslatedCount, skippedCount: units.length - nextTranslatedCount };
-    if (!response.ok) throw new Error(response?.error || "Mirror translation failed");
-
-    response.translations.forEach((translation, offset) => {
-      const group = batch[offset];
-      if (!group || !translation || !isActiveRun(runId)) return;
-      const normalizedTranslation = String(translation);
-      mirrorState.translationCache.set(group.key, normalizedTranslation);
-      nextTranslatedCount += replaceMirrorTextUnits(group.units, normalizedTranslation);
-    });
+  if (mirrorState.isTranslating) {
+    mirrorState.needsTranslation = true;
+    return { translatedCount: 0, skippedCount: 0 };
   }
 
-  return { translatedCount: nextTranslatedCount, skippedCount: units.length - nextTranslatedCount };
+  mirrorState.isTranslating = true;
+  mirrorState.needsTranslation = false;
+
+  try {
+    const units = collectMirrorTextUnits(mirrorState.targetDocument, runtimeState.settings).slice(0, 60);
+    if (units.length === 0) return { translatedCount: 0, skippedCount: 0 };
+
+    mirrorState.lastViewportSignature = getMirrorViewportSignature();
+    const { translatedCount, missingGroups } = collectMissingMirrorTranslationGroups(units, runtimeState.settings);
+    let nextTranslatedCount = translatedCount;
+    const batchSize = getTranslationBatchSize(runtimeState.settings);
+
+    for (let index = 0; index < missingGroups.length; index += batchSize) {
+      if (!isActiveRun(runId) || !mirrorState.active) break;
+
+      const batch = missingGroups.slice(index, index + batchSize);
+      const response = await sendRuntimeMessage({
+        type: "TRANSLATE_BATCH",
+        texts: batch.map((group) => group.text),
+        options: pickRuntimeOptions(runtimeState.settings)
+      });
+
+      if (!response) return { translatedCount: nextTranslatedCount, skippedCount: units.length - nextTranslatedCount };
+      if (!response.ok) throw new Error(response?.error || "Mirror translation failed");
+
+      response.translations.forEach((translation, offset) => {
+        const group = batch[offset];
+        if (!group || !translation || !isActiveRun(runId)) return;
+        const normalizedTranslation = String(translation);
+        mirrorState.translationCache.set(group.key, normalizedTranslation);
+        nextTranslatedCount += replaceMirrorTextUnits(group.units, normalizedTranslation);
+      });
+    }
+
+    return { translatedCount: nextTranslatedCount, skippedCount: units.length - nextTranslatedCount };
+  } finally {
+    mirrorState.isTranslating = false;
+    if (mirrorState.needsTranslation && mirrorState.active && isActiveRun(runId)) {
+      mirrorState.needsTranslation = false;
+      scheduleMirrorTranslation(80);
+    }
+  }
 }
 
 function collectMirrorTextUnits(frameDocument, currentSettings) {
   const units = [];
+  if (!frameDocument?.body || !frameDocument.defaultView) return units;
+
   const walker = frameDocument.createTreeWalker(frameDocument.body, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
       if (!isTranslatableMirrorTextNode(node, frameDocument.defaultView, currentSettings)) {
@@ -593,6 +663,8 @@ function collectMirrorTextUnits(frameDocument, currentSettings) {
 
 function collectMirrorAnchorUnits(frameDocument) {
   const units = [];
+  if (!frameDocument?.body || !frameDocument.defaultView) return units;
+
   const occurrenceByKey = new Map();
   const walker = frameDocument.createTreeWalker(frameDocument.body, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
@@ -634,7 +706,7 @@ function isMirrorAnchorTextNode(node, frameWindow) {
 }
 
 function isValidMirrorTextParent(parent, frameWindow) {
-  if (!parent || parent.closest(EXCLUDED_SELECTOR)) return false;
+  if (!parent || !frameWindow || parent.closest(EXCLUDED_SELECTOR)) return false;
 
   const style = frameWindow.getComputedStyle(parent);
   if (
@@ -650,7 +722,7 @@ function isValidMirrorTextParent(parent, frameWindow) {
 }
 
 function isMirrorElementInViewport(element, frameWindow) {
-  if (!element) return false;
+  if (!element || !frameWindow?.document) return false;
   const rects = Array.from(element.getClientRects()).filter((rect) => rect.width >= 1 && rect.height >= 1);
   if (rects.length === 0) return false;
 
@@ -1859,6 +1931,7 @@ function stopMirrorMode() {
 
   window.clearTimeout(mirrorState.translateTimer);
   mirrorState.translateTimer = null;
+  stopMirrorViewportWatcher();
 
   while (mirrorState.cleanupHandlers.length > 0) {
     const cleanup = mirrorState.cleanupHandlers.pop();
@@ -1879,13 +1952,16 @@ function stopMirrorMode() {
   mirrorState.sourceDocument = null;
   mirrorState.targetDocument = null;
   mirrorState.suppressScrollUntil = 0;
-  mirrorState.originalOverflow = "";
-  mirrorState.originalBodyOverflow = "";
+  mirrorState.isTranslating = false;
+  mirrorState.needsTranslation = false;
+  mirrorState.lastViewportSignature = "";
   mirrorState.translationCache.clear();
   mirrorState.textReplacements.clear();
 
   document.documentElement.style.overflow = mirrorState.originalOverflow;
   document.body.style.overflow = mirrorState.originalBodyOverflow;
+  mirrorState.originalOverflow = "";
+  mirrorState.originalBodyOverflow = "";
 }
 
 function stopSplitMode() {
@@ -1980,3 +2056,4 @@ function isContextInvalidatedError(error) {
     text.includes("Receiving end does not exist")
   );
 }
+})();
