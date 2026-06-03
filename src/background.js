@@ -70,9 +70,25 @@ const PROVIDER_MODEL_LABELS = {
 };
 
 const TRANSLATION_JSON_ARRAY_INSTRUCTION =
-  "Translate each input string faithfully. Preserve meaning, names, numbers, punctuation, and inline whitespace. Return only a JSON array of translated strings.";
+  "Translate each input string faithfully. Preserve meaning, names, numbers, punctuation, and inline whitespace. Return only a JSON array of translated strings with the same length and order as the input.";
+const TRANSLATION_JSON_OBJECT_INSTRUCTION =
+  "Translate each input string faithfully. Preserve meaning, names, numbers, punctuation, and inline whitespace. Return only JSON with this shape: {\"translations\":[\"...\"]}. The translations array must have the same length and order as the input texts.";
 const CLAUDE_SYSTEM_INSTRUCTION =
   "Translate faithfully. Preserve meaning, names, numbers, punctuation, and inline whitespace. Return only a JSON array of translated strings.";
+const TRANSLATION_ARRAY_RESPONSE_KEYS = Object.freeze([
+  "translations",
+  "translatedTexts",
+  "translated_texts",
+  "results",
+  "items"
+]);
+const TRANSLATION_ITEM_RESPONSE_KEYS = Object.freeze([
+  "translation",
+  "translatedText",
+  "translated_text",
+  "text",
+  "output"
+]);
 
 const SPLIT_SCROLL_SIGNATURE_KEYS = [
   "blockId",
@@ -641,12 +657,22 @@ async function translateBatch(texts, options = {}) {
     }, settings);
     return result.translations;
   } catch (error) {
-    await recordTranslationLog({
+    const errorOutputText = getTranslationErrorOutputText(error);
+    const errorLogEntry = {
       ...requestMeta,
       status: "error",
       durationMs: Date.now() - startedAt,
-      error: sanitizeError(error)
-    }, settings);
+      error: sanitizeError(error),
+      usage: error?.translationUsage || null
+    };
+
+    if (errorOutputText) {
+      errorLogEntry.outputCharCount = errorOutputText.length;
+      errorLogEntry.outputEstimatedTokens = estimateTokens(errorOutputText);
+      errorLogEntry.outputPreviews = [errorOutputText.slice(0, 240)];
+    }
+
+    await recordTranslationLog(errorLogEntry, settings);
     throw error;
   }
 }
@@ -785,6 +811,10 @@ function sanitizeError(error) {
     .slice(0, 240);
 }
 
+function getTranslationErrorOutputText(error) {
+  return typeof error?.translationOutputText === "string" ? error.translationOutputText : "";
+}
+
 function buildGoogleTranslateUrl(text, source, target) {
   const url = new URL("https://translate.googleapis.com/translate_a/single");
   url.searchParams.set("client", "gtx");
@@ -885,36 +915,71 @@ async function translateWithOpenAICompatible(texts, settings) {
       "Content-Type": "application/json",
       Authorization: `Bearer ${settings.openaiApiKey}`
     },
-    body: JSON.stringify({
-      model: settings.openaiModel,
-      temperature: 0.1,
-      messages: [
-        {
-          role: "system",
-          content: TRANSLATION_JSON_ARRAY_INSTRUCTION
-        },
-        {
-          role: "user",
-          content: JSON.stringify({
-            target_language: settings.targetLang,
-            source_language: settings.sourceLang,
-            texts
-          })
-        }
-      ]
-    })
+    body: JSON.stringify(buildOpenAICompatibleRequestBody(texts, settings))
   }, settings.providerLabel || "OpenAI-compatible");
 
   const content = payload?.choices?.[0]?.message?.content;
-  const parsed = parseJsonArray(content);
-  if (!parsed || parsed.length !== texts.length) {
-    throw new Error("Translation response was not a JSON array with the expected length.");
-  }
-
   return {
-    translations: parsed.map((item) => cleanTranslation(String(item || ""))),
+    translations: parseTranslations(content, texts.length, payload?.usage),
     usage: normalizeOpenAIUsage(payload?.usage)
   };
+}
+
+function buildOpenAICompatibleRequestBody(texts, settings) {
+  const responseFormat = getOpenAICompatibleResponseFormat(settings);
+  const body = {
+    model: settings.openaiModel,
+    temperature: 0.1,
+    messages: [
+      {
+        role: "system",
+        content: responseFormat ? TRANSLATION_JSON_OBJECT_INSTRUCTION : TRANSLATION_JSON_ARRAY_INSTRUCTION
+      },
+      {
+        role: "user",
+        content: JSON.stringify({
+          target_language: settings.targetLang,
+          source_language: settings.sourceLang,
+          texts
+        })
+      }
+    ]
+  };
+
+  if (responseFormat) body.response_format = responseFormat;
+  return body;
+}
+
+function getOpenAICompatibleResponseFormat(settings) {
+  if (!isOfficialOpenAIEndpoint(settings.openaiEndpoint)) return null;
+
+  return {
+    type: "json_schema",
+    json_schema: {
+      name: "translation_batch",
+      strict: true,
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          translations: {
+            type: "array",
+            description: "Translated strings in the same length and order as the input texts.",
+            items: { type: "string" }
+          }
+        },
+        required: ["translations"]
+      }
+    }
+  };
+}
+
+function isOfficialOpenAIEndpoint(endpoint) {
+  try {
+    return new URL(endpoint).hostname === "api.openai.com";
+  } catch {
+    return false;
+  }
 }
 
 async function translateWithGemini(texts, settings) {
@@ -1017,28 +1082,99 @@ function normalizeClaudeUsage(usage) {
   };
 }
 
-function parseJsonArray(value) {
+function parseJsonValue(value) {
   if (!value) return null;
-  try {
-    return JSON.parse(value);
-  } catch {
-    const match = value.match(/\[[\s\S]*\]/);
-    if (!match) return null;
+  const text = String(value).trim();
+  const candidates = [
+    text,
+    extractFencedJson(text),
+    extractJsonSlice(text, "{", "}"),
+    extractJsonSlice(text, "[", "]")
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
     try {
-      return JSON.parse(match[0]);
+      return JSON.parse(candidate);
     } catch {
-      return null;
+      // Try the next likely JSON slice.
     }
   }
+
+  return null;
 }
 
-function parseTranslations(content, expectedLength) {
-  const parsed = parseJsonArray(content);
-  if (!parsed || parsed.length !== expectedLength) {
-    throw new Error("Translation response was not a JSON array with the expected length.");
+function extractFencedJson(value) {
+  const match = value.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  return match?.[1]?.trim() || null;
+}
+
+function extractJsonSlice(value, open, close) {
+  const start = value.indexOf(open);
+  const end = value.lastIndexOf(close);
+  if (start < 0 || end <= start) return null;
+  return value.slice(start, end + 1);
+}
+
+function parseTranslations(content, expectedLength, usage = null) {
+  const parsed = parseJsonValue(content);
+  const translations = normalizeTranslationArray(parsed);
+  if (!translations || translations.length !== expectedLength) {
+    throw createTranslationParseError(content, usage);
   }
 
-  return parsed.map((item) => cleanTranslation(String(item || "")));
+  return translations.map((item) => cleanTranslation(item));
+}
+
+function normalizeTranslationArray(value) {
+  if (Array.isArray(value)) return normalizeTranslationItems(value);
+  if (!isPlainObject(value)) return null;
+
+  for (const key of TRANSLATION_ARRAY_RESPONSE_KEYS) {
+    const normalized = normalizeTranslationArray(value[key]);
+    if (normalized) return normalized;
+  }
+
+  return null;
+}
+
+function normalizeTranslationItems(items) {
+  const normalized = [];
+
+  for (const item of items) {
+    if (item == null) {
+      normalized.push("");
+      continue;
+    }
+    if (typeof item === "string" || typeof item === "number" || typeof item === "boolean") {
+      normalized.push(String(item));
+      continue;
+    }
+    if (isPlainObject(item)) {
+      const translation = getTranslationItemText(item);
+      if (translation != null) {
+        normalized.push(translation);
+        continue;
+      }
+    }
+    return null;
+  }
+
+  return normalized;
+}
+
+function getTranslationItemText(item) {
+  for (const key of TRANSLATION_ITEM_RESPONSE_KEYS) {
+    if (typeof item[key] === "string") return item[key];
+  }
+
+  return null;
+}
+
+function createTranslationParseError(content, usage = null) {
+  const error = new Error("Translation response did not include the expected number of translations.");
+  error.translationOutputText = typeof content === "string" ? content : "";
+  error.translationUsage = normalizeOpenAIUsage(usage);
+  return error;
 }
 
 function buildTranslationPrompt(targetLang, sourceLang, texts) {
