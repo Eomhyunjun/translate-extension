@@ -30,6 +30,7 @@
             <option value="gpt">GPT / OpenAI</option>
             <option value="gemini">Gemini</option>
             <option value="claude">Claude</option>
+            <option value="solar">Upstage Solar</option>
             <option value="mymemory">MyMemory 무료 API</option>
             <option value="openai">OpenAI-compatible</option>
           </select>
@@ -75,6 +76,15 @@
               <option value="claude-3-5-haiku-latest">claude-3-5-haiku-latest</option>
               <option value="claude-3-5-sonnet-latest">claude-3-5-sonnet-latest</option>
               <option value="claude-3-7-sonnet-latest">claude-3-7-sonnet-latest</option>
+            </select>
+          </label>
+
+          <label class="field provider-field" data-provider-field="solar">
+            <span>Solar model</span>
+            <select id="solarModel">
+              <option value="solar-pro3">solar-pro3</option>
+              <option value="solar-pro2">solar-pro2</option>
+              <option value="solar-mini">solar-mini</option>
             </select>
           </label>
 
@@ -197,6 +207,10 @@
         <label class="field">
           <span>Claude</span>
           <input id="claudeApiKey" type="password" autocomplete="off" placeholder="Anthropic API key" />
+        </label>
+        <label class="field">
+          <span>Upstage Solar</span>
+          <input id="solarApiKey" type="password" autocomplete="off" placeholder="Upstage API key" />
         </label>
         <label class="field">
           <span>OpenAI-compatible</span>

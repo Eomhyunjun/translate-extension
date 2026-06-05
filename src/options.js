@@ -17,6 +17,7 @@ const zhipuModel = document.querySelector("#zhipuModel");
 const gptModel = document.querySelector("#gptModel");
 const geminiModel = document.querySelector("#geminiModel");
 const claudeModel = document.querySelector("#claudeModel");
+const solarModel = document.querySelector("#solarModel");
 const openaiEndpoint = document.querySelector("#openaiEndpoint");
 const openaiModel = document.querySelector("#openaiModel");
 const sourceLang = document.querySelector("#sourceLang");
@@ -38,6 +39,7 @@ const zhipuApiKey = document.querySelector("#zhipuApiKey");
 const gptApiKey = document.querySelector("#gptApiKey");
 const geminiApiKey = document.querySelector("#geminiApiKey");
 const claudeApiKey = document.querySelector("#claudeApiKey");
+const solarApiKey = document.querySelector("#solarApiKey");
 const openaiApiKey = document.querySelector("#openaiApiKey");
 const keepTextLogs = document.querySelector("#keepTextLogs");
 const logsList = document.querySelector("#logsList");
@@ -58,6 +60,7 @@ const API_KEY_INPUTS = Object.freeze({
   gptApiKey,
   geminiApiKey,
   claudeApiKey,
+  solarApiKey,
   openaiApiKey
 });
 
@@ -120,6 +123,7 @@ function fillPublicSettings(settings) {
   gptModel.value = settings.gptModel || DEFAULT_SETTINGS.gptModel;
   geminiModel.value = settings.geminiModel || DEFAULT_SETTINGS.geminiModel;
   claudeModel.value = settings.claudeModel || DEFAULT_SETTINGS.claudeModel;
+  solarModel.value = settings.solarModel || DEFAULT_SETTINGS.solarModel;
   openaiEndpoint.value = settings.openaiEndpoint || DEFAULT_SETTINGS.openaiEndpoint;
   openaiModel.value = settings.openaiModel || DEFAULT_SETTINGS.openaiModel;
   sourceLang.value = settings.sourceLang || DEFAULT_SETTINGS.sourceLang;
@@ -147,6 +151,7 @@ function readPublicSettings() {
     gptModel: gptModel.value,
     geminiModel: geminiModel.value,
     claudeModel: claudeModel.value,
+    solarModel: solarModel.value,
     openaiEndpoint: openaiEndpoint.value.trim() || DEFAULT_SETTINGS.openaiEndpoint,
     openaiModel: openaiModel.value.trim() || DEFAULT_SETTINGS.openaiModel,
     sourceLang: sourceLang.value,

@@ -25,13 +25,14 @@ const RUNTIME_MESSAGE_HANDLERS = {
   [MESSAGE_TYPES.TRANSLATE_BATCH]: handleTranslateBatchMessage
 };
 
-const ALLOWED_PROVIDERS = new Set(["google", "microsoft", "zhipu", "gpt", "gemini", "claude", "openai", "mymemory"]);
+const ALLOWED_PROVIDERS = new Set(["google", "microsoft", "zhipu", "gpt", "gemini", "claude", "solar", "openai", "mymemory"]);
 const ALLOWED_LANGS = new Set(["auto", "ko", "en", "ja", "zh-CN", "zh-TW", "es", "fr", "de"]);
 const ALLOWED_MODELS = {
   zhipuModel: new Set(["glm-4-flash", "glm-4-air", "glm-4-plus"]),
   gptModel: new Set(["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini", "gpt-4o"]),
   geminiModel: new Set(["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]),
-  claudeModel: new Set(["claude-3-5-haiku-latest", "claude-3-5-sonnet-latest", "claude-3-7-sonnet-latest"])
+  claudeModel: new Set(["claude-3-5-haiku-latest", "claude-3-5-sonnet-latest", "claude-3-7-sonnet-latest"]),
+  solarModel: new Set(["solar-pro3", "solar-pro2", "solar-mini"])
 };
 const ALLOWED_SPLIT_VIEW_MODES = new Set(["inline", "split"]);
 const ALLOWED_SPLIT_DISPLAY_MODES = new Set(["below", "replace"]);
@@ -50,6 +51,12 @@ const OPENAI_COMPATIBLE_PROVIDER_CONFIG = {
     modelKey: "gptModel",
     providerLabel: "GPT / OpenAI"
   },
+  solar: {
+    endpointKey: "solarEndpoint",
+    apiKeyKey: "solarApiKey",
+    modelKey: "solarModel",
+    providerLabel: "Upstage Solar"
+  },
   openai: {
     providerLabel: "OpenAI-compatible"
   }
@@ -60,6 +67,7 @@ const PROVIDER_MODEL_KEYS = {
   gpt: "gptModel",
   gemini: "geminiModel",
   claude: "claudeModel",
+  solar: "solarModel",
   openai: "openaiModel"
 };
 
@@ -685,6 +693,7 @@ async function translateBatchWithProvider(texts, settings) {
       return translateWithMicrosoft(texts, settings);
     case "zhipu":
     case "gpt":
+    case "solar":
     case "openai":
       return translateWithOpenAICompatible(texts, getOpenAICompatibleSettings(settings));
     case "gemini":

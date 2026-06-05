@@ -6,6 +6,7 @@ const zhipuModel = document.querySelector("#zhipuModel");
 const gptModel = document.querySelector("#gptModel");
 const geminiModel = document.querySelector("#geminiModel");
 const claudeModel = document.querySelector("#claudeModel");
+const solarModel = document.querySelector("#solarModel");
 const openaiModel = document.querySelector("#openaiModel");
 const sourceLang = document.querySelector("#sourceLang");
 const targetLang = document.querySelector("#targetLang");
@@ -54,6 +55,7 @@ function fill(settings) {
   gptModel.value = settings.gptModel || DEFAULT_SETTINGS.gptModel;
   geminiModel.value = settings.geminiModel || DEFAULT_SETTINGS.geminiModel;
   claudeModel.value = settings.claudeModel || DEFAULT_SETTINGS.claudeModel;
+  solarModel.value = settings.solarModel || DEFAULT_SETTINGS.solarModel;
   openaiModel.value = settings.openaiModel || DEFAULT_SETTINGS.openaiModel;
   sourceLang.value = settings.sourceLang || DEFAULT_SETTINGS.sourceLang;
   targetLang.value = settings.targetLang || DEFAULT_SETTINGS.targetLang;
@@ -85,6 +87,7 @@ function readPopupSettings() {
     gptModel: gptModel.value,
     geminiModel: geminiModel.value,
     claudeModel: claudeModel.value,
+    solarModel: solarModel.value,
     openaiModel: openaiModel.value.trim() || DEFAULT_SETTINGS.openaiModel,
     sourceLang: sourceLang.value,
     targetLang: targetLang.value

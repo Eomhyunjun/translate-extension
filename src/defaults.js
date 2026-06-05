@@ -19,7 +19,9 @@
     geminiEndpoint: "https://generativelanguage.googleapis.com/v1beta",
     geminiModel: "gemini-2.0-flash",
     claudeEndpoint: "https://api.anthropic.com/v1/messages",
-    claudeModel: "claude-3-5-haiku-latest"
+    claudeModel: "claude-3-5-haiku-latest",
+    solarEndpoint: "https://api.upstage.ai/v1/solar/chat/completions",
+    solarModel: "solar-pro3"
   });
 
   const SECRET_DEFAULTS = Object.freeze({
@@ -28,7 +30,8 @@
     zhipuApiKey: "",
     gptApiKey: "",
     geminiApiKey: "",
-    claudeApiKey: ""
+    claudeApiKey: "",
+    solarApiKey: ""
   });
 
   const DEFAULT_SETTING_KEYS = Object.freeze(Object.keys(DEFAULT_SETTINGS));

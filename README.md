@@ -13,7 +13,7 @@ Immersive Translate style browser extension prototype. It translates readable pa
 - Popup buttons start inline translation or same-tab split translation immediately
 - Popup translation removal clears translated text and closes split view
 - Google Translate provider by default
-- Microsoft Translator, Zhipu BigModel, GPT/OpenAI, Gemini, Claude, MyMemory, and OpenAI-compatible providers
+- Microsoft Translator, Zhipu BigModel, GPT/OpenAI, Gemini, Claude, Upstage Solar, MyMemory, and OpenAI-compatible providers
 - API keys stored in `chrome.storage.local`, not synced across browser profiles
 - Optional usage logs stored locally, disabled by default
 
@@ -30,13 +30,14 @@ Immersive Translate style browser extension prototype. It translates readable pa
 
 The default Google provider uses a public web endpoint and requires no key, but it is best treated as a prototype/testing path. It defaults to English source text; change the source language in the settings page when translating other languages.
 
-Microsoft Translator, Zhipu BigModel, GPT/OpenAI, Gemini, and Claude may have free quotas or free-tier credits depending on the provider, but they still require provider accounts and API keys.
+Microsoft Translator, Zhipu BigModel, GPT/OpenAI, Gemini, Claude, and Upstage Solar may have free quotas or free-tier credits depending on the provider, but they still require provider accounts and API keys.
 
 - Microsoft: choose `Microsoft Translator`, then set your Azure Translator key and region.
 - Zhipu: choose `Zhipu BigModel`, then set your Zhipu API key and model, such as `glm-4-flash`.
 - GPT/OpenAI: choose `GPT / OpenAI`, then set your OpenAI API key and model.
 - Gemini: choose `Gemini`, then set your Google AI Studio API key and model.
 - Claude: choose `Claude`, then set your Anthropic API key and model.
+- Upstage Solar: choose `Upstage Solar`, then set your Upstage API key and model, such as `solar-pro3`. The OpenAI-compatible endpoint is fixed to `https://api.upstage.ai/v1/solar/chat/completions`.
 - MyMemory: choose `MyMemory 무료 API`; no key is required, but public limits are low.
 - OpenAI-compatible: choose `OpenAI-compatible`, then set the provider API key, model, and an HTTPS endpoint ending in `/chat/completions`.
 
