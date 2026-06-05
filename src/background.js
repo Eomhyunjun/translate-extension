@@ -6,6 +6,7 @@ const SECRET_DEFAULTS = globalThis.BIT_SECRET_DEFAULTS;
 let logWriteQueue = Promise.resolve();
 const ACTION_CONTEXT_MENU_SETTINGS_ID = "bit-open-settings";
 const SPLIT_SESSIONS_STORAGE_KEY = "splitSessions";
+const SPLIT_REOPEN_STORAGE_KEY = "splitReopen";
 const SPLIT_SCROLL_ECHO_WINDOW_MS = 700;
 const SPLIT_SCROLL_LOOSE_ECHO_WINDOW_MS = 180;
 const splitSessionsByTab = new Map();
@@ -16,13 +17,17 @@ let secretsMigrationReady = null;
 const MESSAGE_TYPES = {
   CLEAR_SPLIT_SESSION: "CLEAR_SPLIT_SESSION",
   SPLIT_SCROLL: "SPLIT_SCROLL",
-  TRANSLATE_BATCH: "TRANSLATE_BATCH"
+  TRANSLATE_BATCH: "TRANSLATE_BATCH",
+  SET_SPLIT_REOPEN: "SET_SPLIT_REOPEN",
+  GET_SPLIT_REOPEN: "GET_SPLIT_REOPEN"
 };
 
 const RUNTIME_MESSAGE_HANDLERS = {
   [MESSAGE_TYPES.CLEAR_SPLIT_SESSION]: handleClearSplitSessionMessage,
   [MESSAGE_TYPES.SPLIT_SCROLL]: relaySplitScroll,
-  [MESSAGE_TYPES.TRANSLATE_BATCH]: handleTranslateBatchMessage
+  [MESSAGE_TYPES.TRANSLATE_BATCH]: handleTranslateBatchMessage,
+  [MESSAGE_TYPES.SET_SPLIT_REOPEN]: handleSetSplitReopenMessage,
+  [MESSAGE_TYPES.GET_SPLIT_REOPEN]: handleGetSplitReopenMessage
 };
 
 const ALLOWED_PROVIDERS = new Set(["google", "microsoft", "zhipu", "gpt", "gemini", "claude", "solar", "openai", "mymemory"]);
@@ -166,6 +171,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   handleSplitTabRemoved(tabId).catch(() => {});
+  clearSplitReopenForTab(tabId).catch(() => {});
 });
 
 function routeRuntimeMessage(message, sender, sendResponse) {
@@ -196,6 +202,44 @@ function handleClearSplitSessionMessage(message) {
 async function handleTranslateBatchMessage(message) {
   const translations = await translateBatch(normalizeTexts(message.texts), sanitizeOptions(message.options));
   return { translations };
+}
+
+async function handleSetSplitReopenMessage(message, sender) {
+  const tabId = normalizeTabId(sender?.tab?.id);
+  if (!Number.isInteger(tabId)) return { stored: false };
+
+  const map = await getSplitReopenMap();
+  if (message.reopen) {
+    map[tabId] = { options: sanitizeSplitOptions(getSplitRawOptions(message)) };
+  } else {
+    delete map[tabId];
+  }
+  await chrome.storage.session.set({ [SPLIT_REOPEN_STORAGE_KEY]: map });
+  return { stored: true };
+}
+
+async function handleGetSplitReopenMessage(message, sender) {
+  const tabId = normalizeTabId(sender?.tab?.id);
+  if (!Number.isInteger(tabId)) return { reopen: false };
+
+  const map = await getSplitReopenMap();
+  const record = map[tabId];
+  if (!isPlainObject(record)) return { reopen: false };
+  return { reopen: true, options: sanitizeSplitOptions(isPlainObject(record.options) ? record.options : {}) };
+}
+
+async function getSplitReopenMap() {
+  const stored = await chrome.storage.session.get({ [SPLIT_REOPEN_STORAGE_KEY]: {} });
+  return isPlainObject(stored[SPLIT_REOPEN_STORAGE_KEY]) ? stored[SPLIT_REOPEN_STORAGE_KEY] : {};
+}
+
+async function clearSplitReopenForTab(tabId) {
+  const normalizedTabId = normalizeTabId(tabId);
+  if (!Number.isInteger(normalizedTabId)) return;
+  const map = await getSplitReopenMap();
+  if (!(normalizedTabId in map)) return;
+  delete map[normalizedTabId];
+  await chrome.storage.session.set({ [SPLIT_REOPEN_STORAGE_KEY]: map });
 }
 
 async function setupActionContextMenu() {
