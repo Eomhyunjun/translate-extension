@@ -1,4 +1,5 @@
 const DEFAULT_SETTINGS = globalThis.BIT_DEFAULT_SETTINGS;
+const SECRET_DEFAULTS = globalThis.BIT_SECRET_DEFAULTS;
 
 const provider = document.querySelector("#provider");
 const providerFields = document.querySelector("#providerFields");
@@ -14,6 +15,9 @@ const inlineBtn = document.querySelector("#inlineBtn");
 const splitBtn = document.querySelector("#splitBtn");
 const clearBtn = document.querySelector("#clearBtn");
 const openSettingsBtn = document.querySelector("#openSettingsBtn");
+const apiKeyNotice = document.querySelector("#apiKeyNotice");
+const apiKeyNoticeText = document.querySelector("#apiKeyNoticeText");
+const setupKeyBtn = document.querySelector("#setupKeyBtn");
 const message = document.querySelector("#message");
 
 const POPUP_MESSAGES = Object.freeze({
@@ -27,10 +31,23 @@ const POPUP_MESSAGES = Object.freeze({
   compatibleEndpointDenied: "OpenAI-compatible endpoint 권한이 승인되지 않아 저장하지 않았습니다."
 });
 
+const PROVIDER_API_KEY_NAMES = Object.freeze({
+  microsoft: "microsoftApiKey",
+  zhipu: "zhipuApiKey",
+  gpt: "gptApiKey",
+  gemini: "geminiApiKey",
+  claude: "claudeApiKey",
+  solar: "solarApiKey",
+  openai: "openaiApiKey"
+});
+
+let providerKeyPresence = {};
+
 init().catch((error) => setMessage(error.message || POPUP_MESSAGES.initFailed));
 
 provider.addEventListener("change", () => {
   syncProviderFields();
+  syncProviderAvailability();
   savePopupSettings().catch((error) => setMessage(error.message || POPUP_MESSAGES.saveFailed));
 });
 
@@ -44,14 +61,17 @@ document.querySelectorAll("select, input").forEach((control) => {
 inlineBtn.addEventListener("click", () => runPopupAction(POPUP_MESSAGES.translateBusy, () => applyTranslation("inline")));
 splitBtn.addEventListener("click", () => runPopupAction(POPUP_MESSAGES.translateBusy, () => applyTranslation("split")));
 clearBtn.addEventListener("click", () => runPopupAction(POPUP_MESSAGES.clearBusy, clearCurrentTabTranslations));
-openSettingsBtn.addEventListener("click", () => {
-  chrome.runtime.openOptionsPage();
-  window.close();
-});
+openSettingsBtn.addEventListener("click", openSettingsPage);
+setupKeyBtn.addEventListener("click", openSettingsPage);
 
 async function init() {
-  const settings = await chrome.storage.sync.get(DEFAULT_SETTINGS);
+  const [settings, secrets] = await Promise.all([
+    chrome.storage.sync.get(DEFAULT_SETTINGS),
+    chrome.storage.local.get(SECRET_DEFAULTS)
+  ]);
+  providerKeyPresence = computeKeyPresence(secrets);
   fill(settings);
+  syncProviderAvailability();
 }
 
 function fill(settings) {
@@ -83,6 +103,54 @@ function syncProviderFields() {
 
   providerFields.hidden = visibleCount === 0;
   providerFields.setAttribute("aria-hidden", String(visibleCount === 0));
+}
+
+function syncProviderAvailability() {
+  syncProviderOptionStates();
+
+  const needsSetup = providerNeedsSetup(provider.value);
+  inlineBtn.disabled = needsSetup;
+  splitBtn.disabled = needsSetup;
+  apiKeyNotice.hidden = !needsSetup;
+  if (needsSetup) {
+    apiKeyNoticeText.textContent =
+      `${providerLabel(provider.value)} 엔진은 API 키가 필요합니다. 상세 설정에서 키를 입력한 뒤 사용할 수 있어요.`;
+  }
+}
+
+function syncProviderOptionStates() {
+  Array.from(provider.options).forEach((option) => {
+    if (option.dataset.baseLabel === undefined) {
+      option.dataset.baseLabel = option.textContent;
+    }
+    const needsSetup = providerNeedsSetup(option.value);
+    option.disabled = needsSetup;
+    option.textContent = needsSetup ? `${option.dataset.baseLabel} (키 필요)` : option.dataset.baseLabel;
+  });
+}
+
+function providerNeedsSetup(providerName) {
+  if (!(providerName in PROVIDER_API_KEY_NAMES)) return false;
+  return providerKeyPresence[providerName] !== true;
+}
+
+function providerLabel(providerName) {
+  const option = Array.from(provider.options).find((item) => item.value === providerName);
+  return option?.dataset.baseLabel || option?.textContent || providerName;
+}
+
+function computeKeyPresence(secrets) {
+  const presence = {};
+  for (const [providerName, keyName] of Object.entries(PROVIDER_API_KEY_NAMES)) {
+    const value = secrets?.[keyName];
+    presence[providerName] = typeof value === "string" && value.trim().length > 0;
+  }
+  return presence;
+}
+
+function openSettingsPage() {
+  chrome.runtime.openOptionsPage();
+  window.close();
 }
 
 function readPopupSettings() {
@@ -193,6 +261,7 @@ function setBusy(isBusy, text = "") {
   splitBtn.disabled = isBusy;
   clearBtn.disabled = isBusy;
   if (text) setMessage(text);
+  if (!isBusy) syncProviderAvailability();
 }
 
 function setMessage(text) {

@@ -108,6 +108,23 @@ button {
   color: #2563eb;
 }
 
+.api-key-notice {
+  display: grid;
+  gap: 8px;
+  margin: 4px 0 12px;
+  padding: 10px 12px;
+  border: 1px solid #fcd34d;
+  border-radius: 8px;
+  background: #fffbeb;
+  color: #92400e;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.api-key-notice p {
+  margin: 0;
+}
+
 .message {
   min-height: 18px;
   margin-top: 10px;
@@ -138,5 +155,11 @@ button {
   .primary {
     border-color: #3b82f6;
     background: #2563eb;
+  }
+
+  .api-key-notice {
+    border-color: #b45309;
+    background: rgba(180, 83, 9, 0.2);
+    color: #fde68a;
   }
 }
