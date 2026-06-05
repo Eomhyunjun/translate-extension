@@ -13,6 +13,7 @@ const targetLang = document.querySelector("#targetLang");
 const inlineBtn = document.querySelector("#inlineBtn");
 const splitBtn = document.querySelector("#splitBtn");
 const clearBtn = document.querySelector("#clearBtn");
+const openSettingsBtn = document.querySelector("#openSettingsBtn");
 const message = document.querySelector("#message");
 
 const POPUP_MESSAGES = Object.freeze({
@@ -43,6 +44,10 @@ document.querySelectorAll("select, input").forEach((control) => {
 inlineBtn.addEventListener("click", () => runPopupAction(POPUP_MESSAGES.translateBusy, () => applyTranslation("inline")));
 splitBtn.addEventListener("click", () => runPopupAction(POPUP_MESSAGES.translateBusy, () => applyTranslation("split")));
 clearBtn.addEventListener("click", () => runPopupAction(POPUP_MESSAGES.clearBusy, clearCurrentTabTranslations));
+openSettingsBtn.addEventListener("click", () => {
+  chrome.runtime.openOptionsPage();
+  window.close();
+});
 
 async function init() {
   const settings = await chrome.storage.sync.get(DEFAULT_SETTINGS);

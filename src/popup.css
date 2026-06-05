@@ -19,6 +19,10 @@ body {
 }
 
 header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   margin-bottom: 14px;
 }
 
@@ -93,6 +97,15 @@ button {
 .secondary {
   width: 100%;
   margin-top: 8px;
+}
+
+.settings-link {
+  flex: none;
+  min-height: 32px;
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 650;
+  color: #2563eb;
 }
 
 .message {
