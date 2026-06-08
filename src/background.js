@@ -5,26 +5,20 @@ const SECRET_DEFAULTS = globalThis.BIT_SECRET_DEFAULTS;
 
 let logWriteQueue = Promise.resolve();
 const ACTION_CONTEXT_MENU_SETTINGS_ID = "bit-open-settings";
-const SPLIT_SESSIONS_STORAGE_KEY = "splitSessions";
 const SPLIT_REOPEN_STORAGE_KEY = "splitReopen";
-const SPLIT_SCROLL_ECHO_WINDOW_MS = 700;
-const SPLIT_SCROLL_LOOSE_ECHO_WINDOW_MS = 180;
-const splitSessionsByTab = new Map();
-const pendingSplitTargets = new Map();
-let splitSessionsReady = null;
+const COMMAND_VIEW_MODES = Object.freeze({
+  "toggle-inline-translation": "inline",
+  "toggle-split-translation": "split"
+});
 let secretsMigrationReady = null;
 
 const MESSAGE_TYPES = {
-  CLEAR_SPLIT_SESSION: "CLEAR_SPLIT_SESSION",
-  SPLIT_SCROLL: "SPLIT_SCROLL",
   TRANSLATE_BATCH: "TRANSLATE_BATCH",
   SET_SPLIT_REOPEN: "SET_SPLIT_REOPEN",
   GET_SPLIT_REOPEN: "GET_SPLIT_REOPEN"
 };
 
 const RUNTIME_MESSAGE_HANDLERS = {
-  [MESSAGE_TYPES.CLEAR_SPLIT_SESSION]: handleClearSplitSessionMessage,
-  [MESSAGE_TYPES.SPLIT_SCROLL]: relaySplitScroll,
   [MESSAGE_TYPES.TRANSLATE_BATCH]: handleTranslateBatchMessage,
   [MESSAGE_TYPES.SET_SPLIT_REOPEN]: handleSetSplitReopenMessage,
   [MESSAGE_TYPES.GET_SPLIT_REOPEN]: handleGetSplitReopenMessage
@@ -103,44 +97,6 @@ const TRANSLATION_ITEM_RESPONSE_KEYS = Object.freeze([
   "output"
 ]);
 
-const SPLIT_SCROLL_SIGNATURE_KEYS = [
-  "blockId",
-  "scrollX",
-  "scrollY",
-  "pageXOffset",
-  "pageYOffset",
-  "scrollLeft",
-  "scrollTop",
-  "left",
-  "top",
-  "x",
-  "y",
-  "ratio",
-  "xRatio",
-  "scrollRatio",
-  "progress",
-  "percent",
-  "anchorKey",
-  "anchorOccurrence",
-  "anchorViewportTop",
-  "containerKey"
-];
-
-const SPLIT_SCROLL_VOLATILE_KEYS = new Set([
-  "type",
-  "tabId",
-  "sourceTabId",
-  "targetTabId",
-  "fromTabId",
-  "toTabId",
-  "originTabId",
-  "relayId",
-  "relayed",
-  "_splitRelay",
-  "timestamp",
-  "ts"
-]);
-
 chrome.runtime.onInstalled.addListener(async () => {
   const stored = await chrome.storage.sync.get(Object.keys(DEFAULT_SETTINGS));
   await chrome.storage.sync.set({ ...DEFAULT_SETTINGS, ...stored });
@@ -164,13 +120,13 @@ chrome.contextMenus.onClicked.addListener((info) => {
 
 chrome.runtime.onMessage.addListener(routeRuntimeMessage);
 
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (changeInfo.status !== "complete") return;
-  activatePendingSplitTarget(tabId).catch(() => {});
+chrome.commands.onCommand.addListener((command) => {
+  handleCommand(command).catch((error) => {
+    console.warn("Shortcut command failed", sanitizeError(error));
+  });
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  handleSplitTabRemoved(tabId).catch(() => {});
   clearSplitReopenForTab(tabId).catch(() => {});
 });
 
@@ -193,10 +149,6 @@ function respondToRuntimeMessage(resultPromise, sendResponse) {
       sendResponse({ ok: true, ...payload });
     })
     .catch((error) => sendResponse({ ok: false, error: sanitizeError(error) }));
-}
-
-function handleClearSplitSessionMessage(message) {
-  return clearSplitSession(message.tabId);
 }
 
 async function handleTranslateBatchMessage(message) {
@@ -242,6 +194,92 @@ async function clearSplitReopenForTab(tabId) {
   await chrome.storage.session.set({ [SPLIT_REOPEN_STORAGE_KEY]: map });
 }
 
+async function handleCommand(command) {
+  const viewMode = COMMAND_VIEW_MODES[command];
+  if (!viewMode) return;
+
+  const tab = await getActiveTabForCommand();
+  if (!Number.isInteger(tab?.id) || !isSupportedPageUrl(tab.url)) return;
+
+  const status = await sendTabMessageWithInjection(tab.id, { type: "GET_PAGE_STATUS" });
+  if (status?.viewMode === viewMode) {
+    await sendTabMessageWithInjection(tab.id, { type: "CLEAR_TRANSLATIONS" });
+    return;
+  }
+
+  if (status?.viewMode) {
+    await sendTabMessageWithInjection(tab.id, { type: "CLEAR_TRANSLATIONS" });
+  }
+
+  const options = await getCommandTranslationOptions(viewMode);
+  const payload = {
+    type: viewMode === "split" ? "START_IN_PAGE_SPLIT" : "TRANSLATE_PAGE",
+    options
+  };
+  const response = await sendTabMessageWithInjection(tab.id, payload);
+  if (!response?.ok) {
+    throw new Error(response?.error || "단축키 번역을 실행하지 못했습니다.");
+  }
+}
+
+async function getActiveTabForCommand() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  return tab || null;
+}
+
+async function getCommandTranslationOptions(viewMode) {
+  const stored = await chrome.storage.sync.get(Object.keys(DEFAULT_SETTINGS));
+  return {
+    ...DEFAULT_SETTINGS,
+    ...sanitizeSettings(stored),
+    viewMode,
+    displayMode: viewMode === "split" ? "replace" : "below",
+    translateScope: "viewport",
+    enabled: true
+  };
+}
+
+async function sendTabMessageWithInjection(tabId, payload) {
+  try {
+    return await chrome.tabs.sendMessage(tabId, payload);
+  } catch (error) {
+    if (!isTransientExtensionError(error)) throw error;
+  }
+
+  await injectContentScript(tabId);
+  return chrome.tabs.sendMessage(tabId, payload);
+}
+
+async function injectContentScript(tabId) {
+  const tab = await chrome.tabs.get(tabId);
+  if (!isSupportedPageUrl(tab?.url)) {
+    throw new Error("현재 페이지에서 실행할 수 없습니다.");
+  }
+
+  await chrome.scripting.insertCSS({
+    target: { tabId },
+    files: ["src/content.css"]
+  });
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: ["src/defaults.js", "src/content.js"]
+  });
+}
+
+function isSupportedPageUrl(url) {
+  return /^(https?|file):\/\//i.test(String(url || ""));
+}
+
+function isTransientExtensionError(error) {
+  const text = error?.message || String(error || "");
+  return (
+    text.includes("Extension context invalidated") ||
+    text.includes("Receiving end does not exist") ||
+    text.includes("message channel closed") ||
+    text.includes("message port closed")
+  );
+}
+
 async function setupActionContextMenu() {
   await removeActionContextMenu();
   await new Promise((resolve, reject) => {
@@ -269,260 +307,8 @@ function removeActionContextMenu() {
   });
 }
 
-async function startSplitMode(message, sender) {
-  throw new Error("Legacy split-window mode is disabled. Use in-page split mode.");
-}
-
-function getSplitSourceTabId(message, sender) {
-  return normalizeTabId(message.sourceTabId ?? message.tabId ?? sender?.tab?.id);
-}
-
 function getSplitRawOptions(message) {
   return isPlainObject(message.options) ? message.options : {};
-}
-
-async function getSupportedSplitSourceTab(tabId) {
-  const sourceTab = await chrome.tabs.get(tabId);
-  if (!isSupportedPageUrl(sourceTab.url)) {
-    throw new Error("This page cannot be opened in split translation mode.");
-  }
-  return sourceTab;
-}
-
-function createSplitSession(sourceTabId, sourceTab, targetTab, options) {
-  const targetTabId = normalizeTabId(targetTab.id);
-  if (!Number.isInteger(targetTabId)) throw new Error("Failed to create translated split tab.");
-
-  return {
-    sourceTabId,
-    targetTabId,
-    sourceWindowId: normalizeTabId(sourceTab.windowId),
-    targetWindowId: normalizeTabId(targetTab.windowId),
-    url: sourceTab.url,
-    options,
-    createdAt: Date.now(),
-    echoSuppressions: []
-  };
-}
-
-async function registerSplitSession(session) {
-  cacheSplitSession(session);
-  pendingSplitTargets.set(session.targetTabId, session);
-  await persistSplitSessions();
-}
-
-function notifySplitSource(session) {
-  chrome.tabs.sendMessage(session.sourceTabId, {
-    type: "START_SPLIT_SOURCE",
-    sourceTabId: session.sourceTabId,
-    targetTabId: session.targetTabId,
-    splitRole: "source",
-    options: session.options
-  }).catch(() => {});
-}
-
-function activateSplitTargetWhenReady(session, targetTab) {
-  if (targetTab.status === "complete") {
-    activatePendingSplitTarget(session.targetTabId).catch(() => {});
-  }
-}
-
-function buildSplitStartedResponse(session) {
-  return {
-    translatedCount: 0,
-    skippedCount: 0,
-    sourceTabId: session.sourceTabId,
-    targetTabId: session.targetTabId,
-    targetWindowId: session.targetWindowId
-  };
-}
-
-async function activatePendingSplitTarget(tabId) {
-  await ensureSplitSessionsLoaded();
-  const session = pendingSplitTargets.get(tabId) || splitSessionsByTab.get(tabId);
-  if (!session || session.targetTabId !== tabId) return;
-
-  const response = await sendTabMessageWithRetry(tabId, {
-    type: "START_SPLIT_TARGET",
-    sourceTabId: session.sourceTabId,
-    targetTabId: session.targetTabId,
-    splitRole: "target",
-    options: session.options
-  }, { attempts: 12, delayMs: 350 });
-
-  if (response?.ok || response == null) {
-    pendingSplitTargets.delete(tabId);
-  }
-}
-
-async function relaySplitScroll(message, sender) {
-  const senderTabId = getSplitScrollSenderTabId(message, sender);
-  if (!Number.isInteger(senderTabId)) return { relayed: false, ignored: true, reason: "missing-sender" };
-  if (isRelayedSplitScrollMessage(message)) {
-    return { relayed: false, ignored: true, reason: "already-relayed" };
-  }
-
-  await ensureSplitSessionsLoaded();
-  const session = splitSessionsByTab.get(senderTabId);
-  if (!session) return { relayed: false, ignored: true, reason: "no-session" };
-
-  const targetTabId = getSplitPeerTabId(session, senderTabId);
-  if (!Number.isInteger(targetTabId)) return { relayed: false, ignored: true, reason: "no-target" };
-  if (shouldSuppressSplitScrollEcho(session, senderTabId, message)) {
-    return { relayed: false, ignored: true, reason: "echo-suppressed" };
-  }
-
-  const relayId = sanitizeRelayId(message.relayId) || makeSplitRelayId(senderTabId, targetTabId);
-  const payload = buildSplitScrollRelayPayload(message, session, senderTabId, targetTabId, relayId);
-  markSplitScrollEchoSuppression(session, targetTabId, message);
-
-  await chrome.tabs.sendMessage(targetTabId, payload).catch(() => {});
-  return { relayed: true, toTabId: targetTabId, relayId };
-}
-
-function getSplitScrollSenderTabId(message, sender) {
-  return normalizeTabId(sender?.tab?.id ?? message.fromTabId ?? message.tabId);
-}
-
-function isRelayedSplitScrollMessage(message) {
-  return message.relayed === true || message._splitRelay === true;
-}
-
-async function clearSplitSession(tabId, { notifyTabs = true } = {}) {
-  await ensureSplitSessionsLoaded();
-  const normalizedTabId = normalizeTabId(tabId);
-  if (!Number.isInteger(normalizedTabId)) return { cleared: false };
-
-  const session = splitSessionsByTab.get(normalizedTabId);
-  if (!session) return { cleared: false };
-
-  deleteCachedSplitSession(session);
-  await persistSplitSessions();
-
-  if (!notifyTabs) return { cleared: true };
-
-  await notifySplitSessionCleared(session);
-
-  return { cleared: true };
-}
-
-async function handleSplitTabRemoved(tabId) {
-  await ensureSplitSessionsLoaded();
-  const normalizedTabId = normalizeTabId(tabId);
-  if (!Number.isInteger(normalizedTabId)) return;
-
-  const session = splitSessionsByTab.get(normalizedTabId);
-  if (!session) return;
-
-  const remainingTabId = getSplitPeerTabId(session, normalizedTabId);
-  await clearSplitSession(normalizedTabId, { notifyTabs: false });
-  if (Number.isInteger(remainingTabId)) {
-    await chrome.tabs.sendMessage(remainingTabId, { type: "CLEAR_TRANSLATIONS" }).catch(() => {});
-  }
-}
-
-function deleteCachedSplitSession(session) {
-  splitSessionsByTab.delete(session.sourceTabId);
-  splitSessionsByTab.delete(session.targetTabId);
-  pendingSplitTargets.delete(session.targetTabId);
-}
-
-function notifySplitSessionCleared(session) {
-  return Promise.allSettled([
-    chrome.tabs.sendMessage(session.sourceTabId, { type: "CLEAR_TRANSLATIONS" }),
-    chrome.tabs.sendMessage(session.targetTabId, { type: "CLEAR_TRANSLATIONS" })
-  ]);
-}
-
-function getSplitPeerTabId(session, tabId) {
-  if (tabId === session.sourceTabId) return session.targetTabId;
-  if (tabId === session.targetTabId) return session.sourceTabId;
-  return null;
-}
-
-async function sendTabMessageWithRetry(tabId, message, { attempts = 6, delayMs = 250 } = {}) {
-  let lastError = null;
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    try {
-      return await chrome.tabs.sendMessage(tabId, message);
-    } catch (error) {
-      lastError = error;
-      await delay(delayMs);
-    }
-  }
-  throw lastError || new Error("Could not connect to tab.");
-}
-
-async function ensureSplitSessionsLoaded() {
-  if (!splitSessionsReady) {
-    splitSessionsReady = chrome.storage.session
-      .get({ [SPLIT_SESSIONS_STORAGE_KEY]: [] })
-      .then((stored) => {
-        splitSessionsByTab.clear();
-        const sessions = Array.isArray(stored[SPLIT_SESSIONS_STORAGE_KEY])
-          ? stored[SPLIT_SESSIONS_STORAGE_KEY]
-          : [];
-        sessions.forEach((record) => {
-          const session = normalizeSplitSessionRecord(record);
-          if (session) cacheSplitSession(session);
-        });
-      });
-  }
-
-  await splitSessionsReady;
-}
-
-function normalizeSplitSessionRecord(record) {
-  if (!isPlainObject(record)) return null;
-  const sourceTabId = normalizeTabId(record.sourceTabId);
-  const targetTabId = normalizeTabId(record.targetTabId);
-  if (!Number.isInteger(sourceTabId) || !Number.isInteger(targetTabId) || sourceTabId === targetTabId) return null;
-
-  return {
-    sourceTabId,
-    targetTabId,
-    sourceWindowId: normalizeTabId(record.sourceWindowId),
-    targetWindowId: normalizeTabId(record.targetWindowId),
-    url: typeof record.url === "string" ? record.url : "",
-    options: sanitizeSplitOptions(isPlainObject(record.options) ? record.options : {}),
-    createdAt: Number.isFinite(record.createdAt) ? record.createdAt : Date.now(),
-    echoSuppressions: []
-  };
-}
-
-function cacheSplitSession(session) {
-  splitSessionsByTab.set(session.sourceTabId, session);
-  splitSessionsByTab.set(session.targetTabId, session);
-}
-
-async function persistSplitSessions() {
-  const seen = new Set();
-  const sessions = [];
-
-  for (const session of splitSessionsByTab.values()) {
-    const key = `${session.sourceTabId}:${session.targetTabId}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    sessions.push({
-      sourceTabId: session.sourceTabId,
-      targetTabId: session.targetTabId,
-      sourceWindowId: session.sourceWindowId,
-      targetWindowId: session.targetWindowId,
-      url: session.url,
-      options: session.options,
-      createdAt: session.createdAt
-    });
-  }
-
-  await chrome.storage.session.set({ [SPLIT_SESSIONS_STORAGE_KEY]: sessions });
-}
-
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function isSupportedPageUrl(url) {
-  return /^(https?|file):\/\//i.test(String(url || ""));
 }
 
 function sanitizeSplitOptions(options = {}) {
@@ -537,109 +323,6 @@ function sanitizeSplitOptions(options = {}) {
   safe.enabled = true;
 
   return safe;
-}
-
-function getSplitTargetActiveState(options = {}) {
-  if (typeof options.active === "boolean") return options.active;
-  if (typeof options.focus === "boolean") return options.focus;
-  if (typeof options.activateTarget === "boolean") return options.activateTarget;
-  if (options.background === true) return false;
-  return true;
-}
-
-function buildSplitScrollRelayPayload(message, session, fromTabId, toTabId, relayId) {
-  const payload = { ...message };
-  delete payload.tabId;
-  delete payload.sourceTabId;
-  delete payload.targetTabId;
-  delete payload.fromTabId;
-  delete payload.toTabId;
-  delete payload.relayed;
-  delete payload._splitRelay;
-
-  return {
-    ...payload,
-    type: "APPLY_SPLIT_SCROLL",
-    sourceTabId: session.sourceTabId,
-    targetTabId: session.targetTabId,
-    fromTabId,
-    toTabId,
-    originTabId: normalizeTabId(message.originTabId) ?? fromTabId,
-    relayId,
-    relayed: true,
-    _splitRelay: true
-  };
-}
-
-function markSplitScrollEchoSuppression(session, tabId, message) {
-  pruneSplitScrollEchoSuppressions(session);
-  const now = Date.now();
-  session.echoSuppressions.push({
-    tabId,
-    signature: getSplitScrollSignature(message),
-    createdAt: now,
-    expiresAt: now + SPLIT_SCROLL_ECHO_WINDOW_MS
-  });
-}
-
-function shouldSuppressSplitScrollEcho(session, tabId, message) {
-  pruneSplitScrollEchoSuppressions(session);
-  const now = Date.now();
-  const signature = getSplitScrollSignature(message);
-  const suppressionIndex = session.echoSuppressions.findIndex((suppression) => (
-    suppression.tabId === tabId &&
-    (suppression.signature === signature || now - suppression.createdAt <= SPLIT_SCROLL_LOOSE_ECHO_WINDOW_MS)
-  ));
-
-  if (suppressionIndex === -1) return false;
-  session.echoSuppressions.splice(suppressionIndex, 1);
-  return true;
-}
-
-function pruneSplitScrollEchoSuppressions(session) {
-  const now = Date.now();
-  session.echoSuppressions = (session.echoSuppressions || []).filter((suppression) => suppression.expiresAt > now);
-}
-
-function getSplitScrollSignature(message) {
-  const parts = [];
-
-  SPLIT_SCROLL_SIGNATURE_KEYS.forEach((key) => {
-    if (!(key in message)) return;
-    const value = message[key];
-    if (typeof value === "number" && Number.isFinite(value)) {
-      parts.push(`${key}:${Math.round(value * 1000) / 1000}`);
-    } else if (typeof value === "string" && value.length < 200) {
-      parts.push(`${key}:${value}`);
-    } else if (typeof value === "boolean") {
-      parts.push(`${key}:${value}`);
-    }
-  });
-
-  if (parts.length > 0) return parts.join("|");
-  return stableStringifyWithoutVolatileKeys(message);
-}
-
-function stableStringifyWithoutVolatileKeys(value) {
-  const safe = {};
-
-  Object.keys(value || {}).sort().forEach((key) => {
-    if (SPLIT_SCROLL_VOLATILE_KEYS.has(key)) return;
-    const item = value[key];
-    if (typeof item === "string" || typeof item === "number" || typeof item === "boolean" || item == null) {
-      safe[key] = item;
-    }
-  });
-
-  return JSON.stringify(safe);
-}
-
-function sanitizeRelayId(value) {
-  return typeof value === "string" && /^[A-Za-z0-9._:-]{1,80}$/.test(value) ? value : null;
-}
-
-function makeSplitRelayId(fromTabId, toTabId) {
-  return `${Date.now()}:${fromTabId}:${toTabId}:${Math.random().toString(36).slice(2, 8)}`;
 }
 
 function normalizeTabId(value) {
@@ -896,9 +579,10 @@ async function fetchJsonOrThrow(resource, init, providerLabel) {
 async function translateWithGoogle(texts, settings) {
   const source = settings.sourceLang === "auto" ? "auto" : normalizeGoogleLang(settings.sourceLang);
   const target = normalizeGoogleLang(settings.targetLang);
-  const translations = [];
 
-  for (const text of texts) {
+  // One request per text, but issued in parallel: Promise.all preserves input
+  // order and rejects on the first failure, matching the old sequential loop.
+  const translations = await Promise.all(texts.map(async (text) => {
     const payload = await fetchJsonOrThrow(
       buildGoogleTranslateUrl(text, source, target),
       undefined,
@@ -907,8 +591,8 @@ async function translateWithGoogle(texts, settings) {
     const translated = Array.isArray(payload?.[0])
       ? payload[0].map((part) => part?.[0] || "").join("")
       : "";
-    translations.push(cleanTranslation(translated));
-  }
+    return cleanTranslation(translated);
+  }));
 
   return { translations };
 }
@@ -916,13 +600,12 @@ async function translateWithGoogle(texts, settings) {
 async function translateWithMyMemory(texts, settings) {
   const source = settings.sourceLang === "auto" ? "en" : settings.sourceLang;
   const target = settings.targetLang;
-  const translations = [];
 
-  for (const text of texts) {
+  const translations = await Promise.all(texts.map(async (text) => {
     const payload = await fetchJsonOrThrow(buildMyMemoryTranslateUrl(text, source, target), undefined, "MyMemory");
     const translated = payload?.responseData?.translatedText;
-    translations.push(cleanTranslation(translated || ""));
-  }
+    return cleanTranslation(translated || "");
+  }));
 
   return { translations };
 }

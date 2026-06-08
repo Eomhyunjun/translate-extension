@@ -13,6 +13,22 @@
       "128": "assets/icon-128.png"
     }
   },
+  "commands": {
+    "toggle-inline-translation": {
+      "suggested_key": {
+        "default": "Alt+Shift+1",
+        "mac": "Command+Shift+1"
+      },
+      "description": "인라인 번역 켜기/끄기"
+    },
+    "toggle-split-translation": {
+      "suggested_key": {
+        "default": "Alt+Shift+2",
+        "mac": "Command+Shift+2"
+      },
+      "description": "좌우 분할 번역 켜기/끄기"
+    }
+  },
   "background": {
     "service_worker": "src/background.js"
   },

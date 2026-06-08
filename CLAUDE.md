@@ -23,7 +23,7 @@ Four execution contexts, each a separate JS realm, coordinated only by message p
 
 - **`src/defaults.js`** — the single source of truth for the settings schema. Loaded *first* into every context (background via `importScripts`, content scripts + popup + options via manifest/script tags). It assigns `BIT_DEFAULT_SETTINGS`, `BIT_SECRET_DEFAULTS`, `BIT_DEFAULT_SETTING_KEYS`, `BIT_SECRET_SETTING_KEYS` onto `globalThis`. Every other file reads its keys from these globals. **Add any new setting key here first.**
 
-- **`src/background.js`** (service worker) — the **provider gateway**. It is the only context that reads API keys and makes translation network calls. Content scripts never see keys; they send a `TRANSLATE_BATCH` message and get translated strings back. Also owns: split-session state (persisted in `chrome.storage.session`), scroll-message relay between split tabs, the action context menu, and the secrets migration.
+- **`src/background.js`** (service worker) — the **provider gateway**. It is the only context that reads API keys and makes translation network calls. Content scripts never see keys; they send a `TRANSLATE_BATCH` message and get translated strings back. Also owns: in-page-split reopen state (persisted per tab in `chrome.storage.session`), the action context menu, and the secrets migration.
 
 - **`src/content.js`** — all DOM work, injected into every page (also re-injectable on demand by the popup via `chrome.scripting`). Self-cleans on re-injection via `window.__bitTranslatorCleanup`. Guards heavily against "Extension context invalidated" errors (see `isContextInvalidatedError` / `disableRuntime`).
 
@@ -37,15 +37,14 @@ Four execution contexts, each a separate JS realm, coordinated only by message p
 
 ### Message protocol
 
-Content script **receives**: `TRANSLATE_PAGE`, `START_IN_PAGE_SPLIT`, `START_SPLIT_SOURCE`, `START_SPLIT_TARGET`, `APPLY_SPLIT_SCROLL`, `SCROLL_TO_BLOCK`, `CLEAR_TRANSLATIONS`, `GET_PAGE_STATUS`.
-Background **receives** (`RUNTIME_MESSAGE_HANDLERS`): `TRANSLATE_BATCH`, `SPLIT_SCROLL`, `CLEAR_SPLIT_SESSION`.
+Content script **receives**: `TRANSLATE_PAGE`, `START_IN_PAGE_SPLIT`, `SCROLL_TO_BLOCK`, `CLEAR_TRANSLATIONS`, `GET_PAGE_STATUS`.
+Background **receives** (`RUNTIME_MESSAGE_HANDLERS`): `TRANSLATE_BATCH`, `SET_SPLIT_REOPEN`, `GET_SPLIT_REOPEN` (the latter two persist/restore the in-page split so it re-opens after an in-pane navigation, keyed by tab in `chrome.storage.session`).
 All handlers answer `{ ok: true, ... }` / `{ ok: false, error }`; async handlers `return true` to keep the channel open.
 
 ### Translation rendering modes (in `content.js`)
 
 1. **inline** (`translatePage`) — collects block elements (`BLOCK_SELECTOR`) + standalone text containers, batches them, and either inserts a `.bit-translation` node below each block or replaces it (`displayMode` = `below` | `replace`).
-2. **in-page split** (`startInPageSplit` + the `mirror*` functions) — the *current* split implementation. Clones `document.body` into a two-pane `.bit-mirror-root` overlay, translates the right pane's visible text nodes in place, and keeps the panes scroll-synced. This is what the popup's "분할 보기" button triggers.
-3. **two-tab split** (`startSplitSource`/`startSplitTarget`, `SPLIT_SCROLL`↔`APPLY_SPLIT_SCROLL` relayed through the background) — legacy scaffolding. The window-spawning entry point (`startSplitMode` in `background.js`) intentionally throws; the in-tab source/target handlers and scroll relay remain but are not wired to a UI button.
+2. **in-page split** (`startInPageSplit` + the `mirror*` functions) — the split implementation. Clones `document.body` into a two-pane `.bit-mirror-root` overlay, translates the right pane's visible text nodes in place, and keeps the panes scroll-synced. This is what the popup's "분할 보기" button triggers. It persists a reopen flag (`SET/GET_SPLIT_REOPEN`) so it can re-open itself after an in-pane link navigation.
 
 Viewport-scoped translation re-runs automatically on scroll/resize, deduped via "viewport signatures" so the same visible set isn't re-translated.
 

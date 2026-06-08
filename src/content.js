@@ -77,7 +77,6 @@ const EXCLUDED_SELECTOR = [
 ].join(",");
 
 const instanceId = `bit-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-const SPLIT_SCROLL_THROTTLE_MS = 120;
 const SPLIT_SCROLL_SUPPRESS_MS = 700;
 const MIRROR_VIEWPORT_WATCH_MS = 500;
 const MIRROR_TRANSLATION_DELAY_MS = {
@@ -100,24 +99,10 @@ const runtimeState = {
   settings: { ...DEFAULT_SETTINGS },
   autoTranslateTimer: null,
   isAutoTranslating: false,
-  isSplitTargetTranslating: false,
   nextBlockId: 1,
   contextAlive: true,
   lastViewportSignature: "",
   cleanupHandlers: []
-};
-const splitState = {
-  active: false,
-  role: null,
-  splitId: null,
-  scrollTimer: null,
-  releaseTimer: null,
-  suppressUntil: 0,
-  lastSentKey: "",
-  lastScrollElement: null,
-  lastScrollAt: 0,
-  translationCache: new Map(),
-  textReplacements: new Map()
 };
 const mirrorState = {
   active: false,
@@ -220,26 +205,6 @@ function handleRuntimeMessage(message, _sender, sendResponse) {
     return true;
   }
 
-  if (message?.type === "START_SPLIT_SOURCE") {
-    startSplitSource(message)
-      .then((result) => safeSendResponse(sendResponse, { ok: true, ...result }))
-      .catch((error) => safeSendResponse(sendResponse, { ok: false, error: error.message || "Split source failed" }));
-    return true;
-  }
-
-  if (message?.type === "START_SPLIT_TARGET") {
-    startSplitTarget(message)
-      .then((result) => safeSendResponse(sendResponse, { ok: true, ...result }))
-      .catch((error) => safeSendResponse(sendResponse, { ok: false, error: error.message || "Split target translation failed" }));
-    return true;
-  }
-
-  if (message?.type === "APPLY_SPLIT_SCROLL") {
-    applySplitScroll(message);
-    safeSendResponse(sendResponse, { ok: true });
-    return false;
-  }
-
   if (message?.type === "SCROLL_TO_BLOCK") {
     scrollToBlock(message.blockId);
     safeSendResponse(sendResponse, { ok: true });
@@ -256,12 +221,14 @@ function handleRuntimeMessage(message, _sender, sendResponse) {
   }
 
   if (message?.type === "GET_PAGE_STATUS") {
+    const inlineTranslatedCount =
+      document.querySelectorAll(".bit-translation").length +
+      document.querySelectorAll(".bit-replaced").length;
     safeSendResponse(sendResponse, {
       ok: true,
+      viewMode: mirrorState.active ? "split" : inlineTranslatedCount > 0 ? "inline" : null,
       translatedCount:
-        document.querySelectorAll(".bit-translation").length +
-        document.querySelectorAll(".bit-replaced").length +
-        splitState.textReplacements.size +
+        inlineTranslatedCount +
         mirrorState.textReplacements.size +
         (mirrorState.active ? 1 : 0)
     });
@@ -285,6 +252,50 @@ function mergeRuntimeSettings(overrides) {
   return runtimeState.settings;
 }
 
+// Shared batch loop for every translation mode: slices `groups` into TRANSLATE_BATCH
+// requests and lets the caller apply each translation. `applyTranslation` returns how
+// many items it rendered, which is summed into the returned `translatedCount`.
+async function runTranslationBatches(groups, {
+  runId,
+  shouldContinue = () => isActiveRun(runId),
+  onBatchStart,
+  onBatchError,
+  errorMessage = "Translation failed",
+  applyTranslation
+}) {
+  const batchSize = getTranslationBatchSize(runtimeState.settings);
+  let translatedCount = 0;
+
+  for (let index = 0; index < groups.length; index += batchSize) {
+    if (!shouldContinue()) break;
+
+    const batch = groups.slice(index, index + batchSize);
+    onBatchStart?.(batch);
+
+    const response = await sendRuntimeMessage({
+      type: "TRANSLATE_BATCH",
+      texts: batch.map((group) => group.text),
+      options: pickRuntimeOptions(runtimeState.settings)
+    });
+
+    if (!response) return { translatedCount, aborted: true };
+
+    if (!response.ok) {
+      const message = response?.error || errorMessage;
+      onBatchError?.(batch, message);
+      throw new Error(message);
+    }
+
+    response.translations.forEach((translation, offset) => {
+      const group = batch[offset];
+      if (!group || !translation || !isActiveRun(runId)) return;
+      translatedCount += applyTranslation(group, translation);
+    });
+  }
+
+  return { translatedCount, aborted: false };
+}
+
 async function translatePage(overrides = {}) {
   if (!runtimeState.contextAlive) return { translatedCount: 0, skippedCount: 0 };
   if (overrides.viewMode === "split") {
@@ -298,7 +309,6 @@ async function translatePage(overrides = {}) {
   const runId = cancelActiveTranslations();
   mergeRuntimeSettings(overrides);
   if (!overrides.auto) {
-    stopSplitMode();
     persistSplitReopen(false);
     syncAutoMode();
   }
@@ -307,40 +317,16 @@ async function translatePage(overrides = {}) {
   const blocks = collectBlocks(runtimeState.settings);
   if (blocks.length === 0) return { translatedCount: 0, skippedCount: 0 };
 
-  let translatedCount = 0;
-  const batchSize = getTranslationBatchSize(runtimeState.settings);
   const groups = groupBlocksByText(blocks);
-
-  for (let index = 0; index < groups.length; index += batchSize) {
-    if (!isActiveRun(runId)) break;
-
-    const batch = groups.slice(index, index + batchSize);
-    markPending(batch.flatMap((group) => group.blocks));
-
-    const response = await sendRuntimeMessage({
-      type: "TRANSLATE_BATCH",
-      texts: batch.map((group) => group.text),
-      options: pickRuntimeOptions(runtimeState.settings)
-    });
-
-    if (!response) {
-      return { translatedCount, skippedCount: blocks.length - translatedCount };
+  const { translatedCount } = await runTranslationBatches(groups, {
+    runId,
+    onBatchStart: (batch) => markPending(batch.flatMap((group) => group.blocks)),
+    onBatchError: (batch, message) => markFailed(batch.flatMap((group) => group.blocks), message),
+    applyTranslation: (group, translation) => {
+      group.blocks.forEach((item) => renderTranslation(item.element, translation, runtimeState.settings.displayMode));
+      return group.blocks.length;
     }
-
-    if (!response.ok) {
-      markFailed(batch.flatMap((group) => group.blocks), response?.error || "Translation failed");
-      throw new Error(response?.error || "Translation failed");
-    }
-
-    response.translations.forEach((translation, offset) => {
-      const group = batch[offset];
-      if (!group || !translation || !isActiveRun(runId)) return;
-      group.blocks.forEach((item) => {
-        renderTranslation(item.element, translation, runtimeState.settings.displayMode);
-        translatedCount += 1;
-      });
-    });
-  }
+  });
 
   return { translatedCount, skippedCount: blocks.length - translatedCount };
 }
@@ -372,7 +358,6 @@ async function startInPageSplit(overrides = {}) {
 
 function prepareMirrorMode() {
   stopAutoMode();
-  stopSplitMode();
   clearTranslations({ keepMirror: true });
   stopMirrorMode();
 }
@@ -729,32 +714,19 @@ async function translateMirrorViewport({ runId = runtimeState.activeRun } = {}) 
     if (units.length === 0) return { translatedCount: 0, skippedCount: 0 };
 
     mirrorState.lastViewportSignature = getMirrorViewportSignature();
-    const { translatedCount, missingGroups } = collectMissingMirrorTranslationGroups(units, runtimeState.settings);
-    let nextTranslatedCount = translatedCount;
-    const batchSize = getTranslationBatchSize(runtimeState.settings);
-
-    for (let index = 0; index < missingGroups.length; index += batchSize) {
-      if (!isActiveRun(runId) || !mirrorState.active) break;
-
-      const batch = missingGroups.slice(index, index + batchSize);
-      const response = await sendRuntimeMessage({
-        type: "TRANSLATE_BATCH",
-        texts: batch.map((group) => group.text),
-        options: pickRuntimeOptions(runtimeState.settings)
-      });
-
-      if (!response) return { translatedCount: nextTranslatedCount, skippedCount: units.length - nextTranslatedCount };
-      if (!response.ok) throw new Error(response?.error || "Mirror translation failed");
-
-      response.translations.forEach((translation, offset) => {
-        const group = batch[offset];
-        if (!group || !translation || !isActiveRun(runId)) return;
+    const { translatedCount: cachedCount, missingGroups } = collectMissingMirrorTranslationGroups(units, runtimeState.settings);
+    const { translatedCount: batchCount } = await runTranslationBatches(missingGroups, {
+      runId,
+      shouldContinue: () => isActiveRun(runId) && mirrorState.active,
+      errorMessage: "Mirror translation failed",
+      applyTranslation: (group, translation) => {
         const normalizedTranslation = String(translation);
         mirrorState.translationCache.set(group.key, normalizedTranslation);
-        nextTranslatedCount += replaceMirrorTextUnits(group.units, normalizedTranslation);
-      });
-    }
+        return replaceMirrorTextUnits(group.units, normalizedTranslation);
+      }
+    });
 
+    const nextTranslatedCount = cachedCount + batchCount;
     return { translatedCount: nextTranslatedCount, skippedCount: units.length - nextTranslatedCount };
   } finally {
     mirrorState.isTranslating = false;
@@ -899,7 +871,7 @@ function collectMissingMirrorTranslationGroups(units, currentSettings) {
   const missingGroups = [];
   const groups = groupDuplicateTextItems(units, {
     bucketName: "units",
-    getKey: (unit) => splitCacheKey(unit.text, currentSettings),
+    getKey: (unit) => translationCacheKey(unit.text, currentSettings),
     getText: (unit) => unit.text
   });
 
@@ -935,41 +907,6 @@ function replaceMirrorTextUnit(unit, translation) {
   return true;
 }
 
-async function startSplitSource(message = {}) {
-  const options = getMessageOptions(message);
-  cancelActiveTranslations();
-  clearTranslations();
-  mergeRuntimeSettings({ ...options, enabled: false });
-  stopAutoMode();
-  startSplitMode("source", message);
-  return { translatedCount: 0, skippedCount: 0 };
-}
-
-async function startSplitTarget(message = {}) {
-  const options = getMessageOptions(message);
-  clearTranslations();
-  startSplitMode("target", message);
-  return translateSplitTarget({
-    ...options,
-    viewMode: "inline",
-    displayMode: "replace",
-    enabled: true
-  });
-}
-
-function startSplitMode(role, message = {}) {
-  splitState.active = true;
-  splitState.role = role;
-  splitState.splitId = message.splitId || message.sessionId || message.options?.splitId || null;
-  resetSplitScrollTracking();
-  scheduleSplitScroll({ immediate: true });
-}
-
-function getMessageOptions(message = {}) {
-  if (message.options && typeof message.options === "object") return message.options;
-  return pickRuntimeOptions(message);
-}
-
 function scheduleAutoTranslate() {
   if (!runtimeState.contextAlive) return;
   window.clearTimeout(runtimeState.autoTranslateTimer);
@@ -980,8 +917,7 @@ function scheduleAutoTranslate() {
   }, 350);
 }
 
-function handlePossibleViewportChange(event) {
-  rememberSplitScrollElement(event);
+function handlePossibleViewportChange() {
   if (mirrorState.active) {
     scheduleMirrorTranslation(MIRROR_TRANSLATION_DELAY_MS.input);
     return;
@@ -993,368 +929,6 @@ function handlePossibleViewportChange(event) {
   ) {
     scheduleAutoTranslate();
   }
-  scheduleSplitScroll();
-}
-
-function scheduleSplitScroll({ immediate = false } = {}) {
-  if (!canSyncSplitScroll()) return;
-
-  if (immediate) {
-    sendSplitScroll();
-    return;
-  }
-
-  if (splitState.scrollTimer) return;
-  splitState.scrollTimer = window.setTimeout(() => {
-    splitState.scrollTimer = null;
-    sendSplitScroll();
-  }, SPLIT_SCROLL_THROTTLE_MS);
-}
-
-function sendSplitScroll() {
-  if (!canSyncSplitScroll()) return;
-  const scroll = getSplitScrollPosition();
-  const key = getSplitScrollKey(scroll);
-  if (key === splitState.lastSentKey) return;
-  splitState.lastSentKey = key;
-
-  sendRuntimeMessage(buildSplitScrollMessage(scroll), { optional: true }).catch((error) => {
-    if (!isContextInvalidatedError(error)) console.warn("Split scroll update failed", error);
-  });
-}
-
-function applySplitScroll(message) {
-  if (!runtimeState.contextAlive || !splitState.active) return;
-  const incoming = message.scroll || message.position || message;
-  if (isOwnSplitScrollMessage(message, incoming)) return;
-
-  const target = resolveSplitScrollTarget(incoming);
-  if (!target) return;
-
-  if (isNearScrollTarget(getCurrentScrollPoint(target), target)) return;
-
-  const releaseAt = beginSplitScrollSuppression();
-  applyResolvedSplitScrollTarget(target);
-  scheduleSplitScrollRelease(releaseAt);
-
-  if (runtimeState.settings.enabled && runtimeState.settings.translateScope === "viewport") scheduleAutoTranslate();
-}
-
-function canSyncSplitScroll() {
-  return runtimeState.contextAlive && splitState.active && !isSplitScrollSuppressed();
-}
-
-function isSplitScrollSuppressed() {
-  return Date.now() < splitState.suppressUntil;
-}
-
-function resetSplitScrollTracking() {
-  splitState.suppressUntil = 0;
-  splitState.lastSentKey = "";
-  splitState.lastScrollElement = null;
-  splitState.lastScrollAt = 0;
-  clearSplitScrollTimer();
-}
-
-function clearSplitScrollTimer() {
-  window.clearTimeout(splitState.scrollTimer);
-  splitState.scrollTimer = null;
-}
-
-function clearSplitReleaseTimer() {
-  window.clearTimeout(splitState.releaseTimer);
-  splitState.releaseTimer = null;
-}
-
-function getSplitScrollKey(scroll) {
-  return [
-    scroll.containerKey || "window",
-    Math.round(scroll.x),
-    Math.round(scroll.y),
-    Math.round(scroll.maxX),
-    Math.round(scroll.maxY),
-    splitState.role,
-    splitState.splitId || ""
-  ].join(":");
-}
-
-function buildSplitScrollMessage(scroll) {
-  return {
-    type: "SPLIT_SCROLL",
-    role: splitState.role,
-    splitRole: splitState.role,
-    splitId: splitState.splitId,
-    instanceId,
-    href: window.location.href,
-    ...scroll,
-    scroll
-  };
-}
-
-function isOwnSplitScrollMessage(message, incoming) {
-  const incomingInstanceId = message.instanceId || incoming.instanceId || message.originInstanceId;
-  return incomingInstanceId && incomingInstanceId === instanceId;
-}
-
-function getWindowScrollPoint() {
-  return {
-    x: window.scrollX || document.scrollingElement?.scrollLeft || 0,
-    y: window.scrollY || document.scrollingElement?.scrollTop || 0
-  };
-}
-
-function getCurrentScrollPoint(target = {}) {
-  const box = resolveSplitScrollBox(target.containerKey);
-  if (box.element) {
-    return {
-      x: box.element.scrollLeft || 0,
-      y: box.element.scrollTop || 0
-    };
-  }
-  return getWindowScrollPoint();
-}
-
-function applyResolvedSplitScrollTarget(target) {
-  const box = resolveSplitScrollBox(target.containerKey);
-  if (box.element) {
-    box.element.scrollLeft = target.x;
-    box.element.scrollTop = target.y;
-    return;
-  }
-  window.scrollTo({ left: target.x, top: target.y, behavior: "auto" });
-}
-
-function isNearScrollTarget(current, target) {
-  return Math.abs(current.x - target.x) < 2 && Math.abs(current.y - target.y) < 2;
-}
-
-function beginSplitScrollSuppression() {
-  const releaseAt = Date.now() + SPLIT_SCROLL_SUPPRESS_MS;
-  splitState.suppressUntil = releaseAt;
-  clearSplitScrollTimer();
-  clearSplitReleaseTimer();
-  return releaseAt;
-}
-
-function scheduleSplitScrollRelease(releaseAt) {
-  splitState.releaseTimer = window.setTimeout(() => {
-    if (splitState.suppressUntil === releaseAt) splitState.suppressUntil = 0;
-  }, SPLIT_SCROLL_SUPPRESS_MS);
-}
-
-function rememberSplitScrollElement(event) {
-  if (!splitState.active || !event?.target) return;
-  const element = normalizeScrollEventTarget(event.target);
-  if (!element || !isScrollableElement(element)) return;
-
-  splitState.lastScrollElement = element;
-  splitState.lastScrollAt = Date.now();
-}
-
-function normalizeScrollEventTarget(target) {
-  if (target === document || target === window) return document.scrollingElement || document.documentElement;
-  if (target === document.body || target === document.documentElement) return document.scrollingElement || document.documentElement;
-  return target instanceof Element ? target : null;
-}
-
-function resolveSplitScrollBox(containerKey) {
-  let element = null;
-  if (containerKey && containerKey !== "window") {
-    element = findElementByDomPath(containerKey);
-  } else if (!containerKey) {
-    element = getActiveSplitScrollElement();
-  }
-
-  if (element && !isDocumentScrollElement(element) && isScrollableElement(element)) {
-    return {
-      key: getElementDomPath(element),
-      element,
-      scrollLeft: element.scrollLeft || 0,
-      scrollTop: element.scrollTop || 0,
-      scrollWidth: Math.max(element.scrollWidth, element.clientWidth),
-      scrollHeight: Math.max(element.scrollHeight, element.clientHeight),
-      viewportWidth: element.clientWidth || 0,
-      viewportHeight: element.clientHeight || 0
-    };
-  }
-
-  const scrollingElement = document.scrollingElement || document.documentElement;
-  const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
-  const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
-  return {
-    key: "window",
-    element: null,
-    scrollLeft: window.scrollX || scrollingElement.scrollLeft || 0,
-    scrollTop: window.scrollY || scrollingElement.scrollTop || 0,
-    scrollWidth: Math.max(scrollingElement.scrollWidth, document.documentElement.scrollWidth, document.body?.scrollWidth || 0),
-    scrollHeight: Math.max(scrollingElement.scrollHeight, document.documentElement.scrollHeight, document.body?.scrollHeight || 0),
-    viewportWidth,
-    viewportHeight
-  };
-}
-
-function getActiveSplitScrollElement() {
-  if (
-    splitState.lastScrollElement?.isConnected &&
-    Date.now() - splitState.lastScrollAt < 1200 &&
-    isScrollableElement(splitState.lastScrollElement)
-  ) {
-    return splitState.lastScrollElement;
-  }
-
-  return document.scrollingElement || document.documentElement;
-}
-
-function isDocumentScrollElement(element) {
-  return element === document.scrollingElement || element === document.documentElement || element === document.body;
-}
-
-function isScrollableElement(element) {
-  if (!element) return false;
-  const maxX = Math.max(0, element.scrollWidth - element.clientWidth);
-  const maxY = Math.max(0, element.scrollHeight - element.clientHeight);
-  return maxX > 1 || maxY > 1;
-}
-
-function getElementDomPath(element) {
-  if (!element || isDocumentScrollElement(element)) return "window";
-
-  const parts = [];
-  let current = element;
-  while (current && current !== document.body && current !== document.documentElement) {
-    const parent = current.parentElement;
-    if (!parent) break;
-
-    const index = Array.prototype.indexOf.call(parent.children, current) + 1;
-    parts.push(`${current.tagName.toLowerCase()}:nth-child(${index})`);
-    current = parent;
-  }
-
-  return parts.length ? `body>${parts.reverse().join(">")}` : "window";
-}
-
-function findElementByDomPath(path) {
-  if (!path || path === "window") return null;
-  try {
-    return document.querySelector(path);
-  } catch {
-    return null;
-  }
-}
-
-function getSplitScrollPosition() {
-  const metrics = getSplitScrollMetrics();
-  const anchor = getSplitScrollAnchor(metrics);
-
-  return {
-    ...metrics,
-    anchor,
-    anchorKey: anchor?.key || "",
-    anchorOccurrence: anchor?.occurrence ?? -1,
-    anchorViewportTop: anchor?.viewportTop ?? 0,
-    containerKey: metrics.containerKey,
-    at: Date.now()
-  };
-}
-
-function getSplitScrollMetrics(containerKey) {
-  const box = resolveSplitScrollBox(containerKey);
-  const viewportWidth = box.viewportWidth;
-  const viewportHeight = box.viewportHeight;
-  const documentWidth = box.scrollWidth;
-  const documentHeight = box.scrollHeight;
-  const maxX = Math.max(0, documentWidth - viewportWidth);
-  const maxY = Math.max(0, documentHeight - viewportHeight);
-  const x = box.scrollLeft;
-  const y = box.scrollTop;
-
-  return {
-    x,
-    y,
-    scrollX: x,
-    scrollY: y,
-    maxX,
-    maxY,
-    ratioX: maxX > 0 ? x / maxX : 0,
-    ratioY: maxY > 0 ? y / maxY : 0,
-    viewportWidth,
-    viewportHeight,
-    documentWidth,
-    documentHeight,
-    containerKey: box.key
-  };
-}
-
-function resolveSplitScrollTarget(scroll) {
-  const anchorTarget = resolveSplitAnchorScrollTarget(scroll.anchor || scroll);
-  if (anchorTarget) return anchorTarget;
-
-  const current = getSplitScrollMetrics(scroll.containerKey);
-  const ratioX = firstFinite(scroll.ratioX, scroll.xRatio, scroll.leftRatio);
-  const ratioY = firstFinite(scroll.ratioY, scroll.yRatio, scroll.topRatio, scroll.ratio);
-  const rawX = firstFinite(scroll.x, scroll.scrollX, scroll.left);
-  const rawY = firstFinite(scroll.y, scroll.scrollY, scroll.top);
-  const x = ratioX === null ? rawX : ratioX * current.maxX;
-  const y = ratioY === null ? rawY : ratioY * current.maxY;
-
-  if (x === null && y === null) return null;
-  return {
-    containerKey: current.containerKey,
-    x: clamp(Math.round(x ?? current.x), 0, current.maxX),
-    y: clamp(Math.round(y ?? current.y), 0, current.maxY)
-  };
-}
-
-function getSplitScrollAnchor(metrics = getSplitScrollMetrics()) {
-  const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
-  const preferredTop = Math.min(Math.max(80, viewportHeight * 0.18), viewportHeight * 0.45);
-  const candidates = [];
-
-  collectSplitAnchorUnits().forEach((unit) => {
-    const rect = getTextUnitRect(unit);
-    if (!rect || rect.bottom < 0 || rect.top > viewportHeight) return;
-    candidates.push({
-      unit,
-      rect,
-      score: Math.abs(rect.top - preferredTop)
-    });
-  });
-
-  candidates.sort((a, b) => a.score - b.score || a.rect.top - b.rect.top);
-  const best = candidates[0];
-  if (!best) return null;
-
-  return {
-    key: best.unit.key,
-    occurrence: best.unit.occurrence,
-    containerKey: metrics.containerKey,
-    viewportTop: clamp(Math.round(best.rect.top), 0, Math.max(0, viewportHeight - 1))
-  };
-}
-
-function resolveSplitAnchorScrollTarget(anchor) {
-  const key = anchor?.key || anchor?.anchorKey;
-  const occurrence = Number(anchor?.occurrence ?? anchor?.anchorOccurrence);
-  if (!key || !Number.isInteger(occurrence)) return null;
-
-  const unit = findSplitAnchorUnit(key, occurrence);
-  if (!unit) return null;
-
-  const rect = getTextUnitRect(unit);
-  if (!rect) return null;
-
-  const current = getSplitScrollMetrics(anchor.containerKey);
-  const desiredViewportTop = clamp(
-    Number(anchor.viewportTop ?? anchor.anchorViewportTop) || 0,
-    0,
-    Math.max(0, current.viewportHeight - 1)
-  );
-
-  return {
-    containerKey: current.containerKey,
-    x: current.x,
-    y: clamp(Math.round(current.y + rect.top - desiredViewportTop), 0, current.maxY)
-  };
 }
 
 function syncAutoMode() {
@@ -1382,8 +956,7 @@ async function translateVisibleIfEnabled() {
   if (
     !runtimeState.contextAlive ||
     !runtimeState.settings.enabled ||
-    runtimeState.isAutoTranslating ||
-    runtimeState.isSplitTargetTranslating
+    runtimeState.isAutoTranslating
   ) {
     return;
   }
@@ -1391,77 +964,18 @@ async function translateVisibleIfEnabled() {
     scheduleMirrorTranslation(MIRROR_TRANSLATION_DELAY_MS.retry);
     return;
   }
-  const signature = splitState.role === "target" ? getSplitViewportSignature() : getViewportSignature();
+  const signature = getViewportSignature();
   if (signature && signature === runtimeState.lastViewportSignature) return;
   runtimeState.lastViewportSignature = signature;
   runtimeState.isAutoTranslating = true;
   try {
-    if (splitState.role === "target") {
-      await translateSplitTarget({ ...runtimeState.settings, translateScope: "viewport", enabled: true, auto: true });
-    } else {
-      await translatePage({ ...runtimeState.settings, translateScope: "viewport", enabled: true, auto: true });
-    }
+    await translatePage({ ...runtimeState.settings, translateScope: "viewport", enabled: true, auto: true });
   } catch (error) {
     if (!isContextInvalidatedError(error)) {
       console.warn("Auto translation failed", error);
     }
   } finally {
     runtimeState.isAutoTranslating = false;
-  }
-}
-
-async function translateSplitTarget(overrides = {}) {
-  if (!runtimeState.contextAlive) return { translatedCount: 0, skippedCount: 0 };
-  if (overrides.auto && runtimeState.isSplitTargetTranslating) return { translatedCount: 0, skippedCount: 0 };
-
-  const runId = cancelActiveTranslations();
-  runtimeState.isSplitTargetTranslating = true;
-  try {
-    mergeRuntimeSettings({ ...overrides, viewMode: "inline", displayMode: "replace", enabled: true });
-    const shouldSyncAutoMode = !overrides.auto;
-
-    const units = collectSplitTextUnits(runtimeState.settings);
-    if (units.length === 0) {
-      if (shouldSyncAutoMode) syncAutoMode();
-      scheduleSplitScroll({ immediate: true });
-      return { translatedCount: 0, skippedCount: 0 };
-    }
-
-    let { translatedCount, missingGroups } = collectMissingSplitTranslationGroups(units, runtimeState.settings);
-    const batchSize = getTranslationBatchSize(runtimeState.settings);
-
-    for (let index = 0; index < missingGroups.length; index += batchSize) {
-      if (!isActiveRun(runId)) break;
-
-      const batch = missingGroups.slice(index, index + batchSize);
-      const response = await sendRuntimeMessage({
-        type: "TRANSLATE_BATCH",
-        texts: batch.map((group) => group.text),
-        options: pickRuntimeOptions(runtimeState.settings)
-      });
-
-      if (!response) {
-        return { translatedCount, skippedCount: units.length - translatedCount };
-      }
-
-      if (!response.ok) {
-        throw new Error(response?.error || "Split target translation failed");
-      }
-
-      response.translations.forEach((translation, offset) => {
-        const group = batch[offset];
-        if (!group || !translation || !isActiveRun(runId)) return;
-        const normalizedTranslation = String(translation);
-        cacheSplitTranslation(group.key, normalizedTranslation);
-        translatedCount += replaceSplitTextUnits(group.units, normalizedTranslation);
-      });
-    }
-
-    scheduleSplitScroll({ immediate: true });
-    if (shouldSyncAutoMode) syncAutoMode();
-    return { translatedCount, skippedCount: units.length - translatedCount };
-  } finally {
-    if (isActiveRun(runId)) runtimeState.isSplitTargetTranslating = false;
   }
 }
 
@@ -1477,28 +991,13 @@ function getViewportSignature() {
     .join("|");
 }
 
-function getSplitViewportSignature() {
-  return collectSplitTextUnits({ ...runtimeState.settings, translateScope: "viewport" })
-    .slice(0, 48)
-    .map((unit) => `${ensureBlockId(unit.element)}:${unit.text.slice(0, 80)}`)
-    .join("|");
-}
-
-function splitCacheKey(text, currentSettings) {
+function translationCacheKey(text, currentSettings) {
   return [
     currentSettings.provider || DEFAULT_SETTINGS.provider,
     currentSettings.sourceLang || DEFAULT_SETTINGS.sourceLang,
     currentSettings.targetLang || DEFAULT_SETTINGS.targetLang,
     text
   ].join("\u0000");
-}
-
-function getCachedSplitTranslation(key) {
-  return splitState.translationCache.get(key);
-}
-
-function cacheSplitTranslation(key, translation) {
-  splitState.translationCache.set(key, translation);
 }
 
 function collectBlocks(currentSettings) {
@@ -1538,28 +1037,6 @@ function groupBlocksByText(blocks) {
     bucketName: "blocks",
     getText: (block) => block.text
   });
-}
-
-function collectMissingSplitTranslationGroups(units, currentSettings) {
-  let translatedCount = 0;
-  const missingGroups = [];
-  const groups = groupDuplicateTextItems(units, {
-    bucketName: "units",
-    getKey: (unit) => splitCacheKey(unit.text, currentSettings),
-    getText: (unit) => unit.text
-  });
-
-  groups.forEach((group) => {
-    const cachedTranslation = getCachedSplitTranslation(group.key);
-    if (cachedTranslation) {
-      translatedCount += replaceSplitTextUnits(group.units, cachedTranslation);
-      return;
-    }
-
-    missingGroups.push(group);
-  });
-
-  return { translatedCount, missingGroups };
 }
 
 function groupDuplicateTextItems(items, { bucketName, getText, getKey = getText }) {
@@ -1616,125 +1093,6 @@ function collectTextNodeContainers() {
   }
 
   return Array.from(containers);
-}
-
-function collectSplitTextUnits(currentSettings) {
-  if (!document.body) return [];
-  const units = [];
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
-    acceptNode(node) {
-      return getSplitTextNodeFilter(node, currentSettings);
-    }
-  });
-
-  while (walker.nextNode()) {
-    const unit = createSplitTextUnit(walker.currentNode);
-    if (unit) units.push(unit);
-  }
-
-  return units;
-}
-
-function collectSplitAnchorUnits() {
-  if (!document.body) return [];
-
-  const units = [];
-  const occurrenceByKey = new Map();
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
-    acceptNode(node) {
-      return isSplitAnchorTextNode(node)
-        ? NodeFilter.FILTER_ACCEPT
-        : NodeFilter.FILTER_REJECT;
-    }
-  });
-
-  while (walker.nextNode()) {
-    const unit = createSplitAnchorUnit(walker.currentNode, occurrenceByKey);
-    if (unit) units.push(unit);
-  }
-
-  return units;
-}
-
-function findSplitAnchorUnit(key, occurrence) {
-  const units = collectSplitAnchorUnits();
-  return units.find((unit) => unit.key === key && unit.occurrence === occurrence) || null;
-}
-
-function getSplitTextNodeFilter(node, currentSettings) {
-  return isTranslatableSplitTextNode(node, currentSettings)
-    ? NodeFilter.FILTER_ACCEPT
-    : NodeFilter.FILTER_REJECT;
-}
-
-function isSplitAnchorTextNode(node) {
-  const text = getOriginalTextNodeText(node);
-  if (!isUsefulText(text)) return false;
-
-  const parent = node.parentElement;
-  if (!parent || parent.closest(EXCLUDED_SELECTOR)) return false;
-  if (hasFixedOrStickyAncestor(parent)) return false;
-  if (!isElementVisible(parent)) return false;
-
-  return Boolean(getTextNodeRect(node) || parent.getClientRects().length);
-}
-
-function hasFixedOrStickyAncestor(element) {
-  let current = element;
-  while (current && current !== document.body) {
-    const position = window.getComputedStyle(current).position;
-    if (position === "fixed" || position === "sticky") return true;
-    current = current.parentElement;
-  }
-  return false;
-}
-
-function isTranslatableSplitTextNode(node, currentSettings) {
-  if (splitState.textReplacements.has(node)) return false;
-
-  const text = normalizeText(node.nodeValue || "");
-  if (!isUsefulText(text)) return false;
-  if (shouldSkipTranslatedText(text, currentSettings)) return false;
-
-  const parent = node.parentElement;
-  if (!parent || parent.closest(EXCLUDED_SELECTOR)) return false;
-  if (parent.closest(".bit-replaced[data-bit-original-text]")) return false;
-  if (!isElementVisible(parent)) return false;
-  if (currentSettings.translateScope === "viewport" && !isElementInViewport(parent)) return false;
-
-  return true;
-}
-
-function createSplitTextUnit(textNode) {
-  const element = textNode.parentElement;
-  if (!element) return null;
-  return {
-    textNode,
-    element,
-    text: normalizeText(textNode.nodeValue || "")
-  };
-}
-
-function createSplitAnchorUnit(textNode, occurrenceByKey) {
-  const element = textNode.parentElement;
-  if (!element) return null;
-
-  const text = getOriginalTextNodeText(textNode);
-  const key = makeTextAnchorKey(text);
-  const occurrence = occurrenceByKey.get(key) || 0;
-  occurrenceByKey.set(key, occurrence + 1);
-
-  return {
-    textNode,
-    element,
-    key,
-    occurrence
-  };
-}
-
-function getOriginalTextNodeText(textNode) {
-  const replacement = splitState.textReplacements.get(textNode);
-  return normalizeText(replacement?.originalText || textNode.nodeValue || "");
 }
 
 function makeTextAnchorKey(text) {
@@ -1986,24 +1344,6 @@ function createTranslationNode(translation) {
   return translationNode;
 }
 
-function replaceSplitTextUnit(unit, translation) {
-  const textNode = unit.textNode;
-  if (!textNode?.isConnected || splitState.textReplacements.has(textNode)) return false;
-  if (normalizeText(textNode.nodeValue || "") !== unit.text) return false;
-
-  const originalText = textNode.nodeValue || "";
-  const translatedText = preserveTextNodeSpacing(originalText, translation);
-  splitState.textReplacements.set(textNode, { originalText, translatedText });
-  textNode.nodeValue = translatedText;
-  return true;
-}
-
-function replaceSplitTextUnits(units, translation) {
-  return units.reduce((count, unit) => (
-    replaceSplitTextUnit(unit, translation) ? count + 1 : count
-  ), 0);
-}
-
 function preserveTextNodeSpacing(originalText, translation) {
   const leading = originalText.match(/^\s*/)?.[0] || "";
   const trailing = originalText.match(/\s*$/)?.[0] || "";
@@ -2027,11 +1367,8 @@ function markFailed(batch, message) {
 }
 
 function clearTranslations(options = {}) {
-  splitState.translationCache.clear();
   runtimeState.lastViewportSignature = "";
   if (!options.keepMirror) stopMirrorMode();
-  if (!options.keepSplit) stopSplitMode();
-  restoreSplitTextReplacements();
   document.querySelectorAll(".bit-translation").forEach((node) => node.remove());
   document.querySelectorAll(".bit-pending, .bit-failed").forEach((node) => {
     node.classList.remove("bit-pending", "bit-failed");
@@ -2047,15 +1384,6 @@ function clearTranslations(options = {}) {
     node.classList.remove("bit-replaced");
     delete node.dataset.bitOriginalText;
   });
-}
-
-function restoreSplitTextReplacements() {
-  splitState.textReplacements.forEach((state, textNode) => {
-    if (textNode.isConnected && textNode.nodeValue === state.translatedText) {
-      textNode.nodeValue = state.originalText;
-    }
-  });
-  splitState.textReplacements.clear();
 }
 
 function stopMirrorMode() {
@@ -2107,15 +1435,6 @@ function restoreMirrorPageOverflow(
   document.body.style.overflow = originalBodyOverflow;
 }
 
-function stopSplitMode() {
-  runtimeState.isSplitTargetTranslating = false;
-  splitState.active = false;
-  splitState.role = null;
-  splitState.splitId = null;
-  resetSplitScrollTracking();
-  clearSplitReleaseTimer();
-}
-
 function pickRuntimeOptions(currentSettings) {
   const allowed = ["targetLang", "sourceLang", "viewMode", "displayMode", "translateScope", "skipTranslated", "batchSize", "provider"];
   return Object.fromEntries(Object.entries(currentSettings).filter(([key]) => allowed.includes(key)));
@@ -2133,15 +1452,6 @@ function looksMostlyKorean(value) {
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
-}
-
-function firstFinite(...values) {
-  for (const value of values) {
-    if (value === undefined || value === null || value === "") continue;
-    const number = Number(value);
-    if (Number.isFinite(number)) return number;
-  }
-  return null;
 }
 
 async function sendRuntimeMessage(message, { optional = false } = {}) {
@@ -2180,7 +1490,6 @@ function stopTranslationRuntime() {
   runtimeState.settings.enabled = false;
   stopAutoMode();
   stopMirrorMode();
-  stopSplitMode();
 }
 
 function isExtensionContextAlive() {

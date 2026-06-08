@@ -210,10 +210,7 @@ async function applyTranslation(viewMode) {
 
 async function clearCurrentTabTranslations() {
   const tab = await getActiveTab();
-  await Promise.allSettled([
-    sendTabMessage(tab.id, { type: "CLEAR_TRANSLATIONS" }),
-    chrome.runtime.sendMessage({ type: "CLEAR_SPLIT_SESSION", tabId: tab.id })
-  ]);
+  await sendTabMessage(tab.id, { type: "CLEAR_TRANSLATIONS" }).catch(() => {});
   setMessage("번역을 제거했습니다.");
 }
 
