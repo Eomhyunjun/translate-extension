@@ -77,11 +77,11 @@ const PROVIDER_MODEL_LABELS = {
 };
 
 const TRANSLATION_JSON_ARRAY_INSTRUCTION =
-  "Translate each input string faithfully. Preserve meaning, names, numbers, punctuation, and inline whitespace. Return only a JSON array of translated strings with the same length and order as the input.";
+  "Translate each input string faithfully. Preserve meaning, names, numbers, punctuation, and inline whitespace. Return only a JSON array of translated strings with the same length and order as the input. Do not merge, split, omit, or add items.";
 const TRANSLATION_JSON_OBJECT_INSTRUCTION =
-  "Translate each input string faithfully. Preserve meaning, names, numbers, punctuation, and inline whitespace. Return only JSON with this shape: {\"translations\":[\"...\"]}. The translations array must have the same length and order as the input texts.";
+  "Translate each input string faithfully. Preserve meaning, names, numbers, punctuation, and inline whitespace. Return only JSON with this shape: {\"translations\":[\"...\"]}. The translations array must have the same length and order as the input texts. Do not merge, split, omit, or add items.";
 const CLAUDE_SYSTEM_INSTRUCTION =
-  "Translate faithfully. Preserve meaning, names, numbers, punctuation, and inline whitespace. Return only a JSON array of translated strings.";
+  "Translate faithfully. Preserve meaning, names, numbers, punctuation, and inline whitespace. Return only a JSON array of translated strings. Do not merge, split, omit, or add items.";
 const TRANSLATION_ARRAY_RESPONSE_KEYS = Object.freeze([
   "translations",
   "translatedTexts",
@@ -676,6 +676,7 @@ function buildOpenAICompatibleRequestBody(texts, settings) {
         content: JSON.stringify({
           target_language: settings.targetLang,
           source_language: settings.sourceLang,
+          expected_count: texts.length,
           texts
         })
       }
@@ -853,12 +854,18 @@ function extractJsonSlice(value, open, close) {
 
 function parseTranslations(content, expectedLength, usage = null) {
   const parsed = parseJsonValue(content);
-  const translations = normalizeTranslationArray(parsed);
+  const translations = normalizeTranslationArray(parsed) || normalizeSingleTranslationObject(parsed, expectedLength);
   if (!translations || translations.length !== expectedLength) {
     throw createTranslationParseError(content, usage);
   }
 
   return translations.map((item) => cleanTranslation(item));
+}
+
+function normalizeSingleTranslationObject(value, expectedLength) {
+  if (expectedLength !== 1 || !isPlainObject(value)) return null;
+  const translation = getTranslationItemText(value);
+  return translation == null ? null : [translation];
 }
 
 function normalizeTranslationArray(value) {
@@ -916,9 +923,10 @@ function createTranslationParseError(content, usage = null) {
 function buildTranslationPrompt(targetLang, sourceLang, texts) {
   return JSON.stringify({
     instruction:
-      "Translate each input string faithfully. Preserve meaning, names, numbers, punctuation, and inline whitespace. Return only a JSON array of translated strings.",
+      "Translate each input string faithfully. Preserve meaning, names, numbers, punctuation, and inline whitespace. Return only a JSON array of translated strings. Return exactly one translated string for each input string. Do not merge, split, omit, or add items.",
     target_language: targetLang,
     source_language: sourceLang,
+    expected_count: texts.length,
     texts
   });
 }

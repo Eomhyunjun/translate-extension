@@ -94,6 +94,9 @@ const MIRROR_SELECTORS = {
 };
 const MIRROR_TRANSIENT_CLASSES = ["bit-pending", "bit-failed", "bit-replaced"];
 const MIRROR_TRANSIENT_ATTRIBUTES = ["data-bit-error", "data-bit-translated-text", "data-bit-original-text"];
+const MIRROR_CLONE_NODE_ID_ATTRIBUTE = "data-bit-mirror-node-id";
+const MIRROR_POSITIONED_ATTRIBUTE = "data-bit-mirror-positioned";
+const TRANSLATION_COUNT_MISMATCH_MESSAGE = "Translation response did not include the expected number of translations.";
 const runtimeState = {
   activeRun: 0,
   settings: { ...DEFAULT_SETTINGS },
@@ -282,11 +285,47 @@ async function runTranslationBatches(groups, {
 
     if (!response.ok) {
       const message = response?.error || errorMessage;
+      if (isTranslationCountMismatchError(message)) {
+        if (batch.length > 1) {
+          const fallback = await runSingleTranslationFallback(batch, {
+            runId,
+            shouldContinue,
+            onBatchError,
+            errorMessage,
+            applyTranslation
+          });
+          translatedCount += fallback.translatedCount;
+          if (fallback.aborted) return { translatedCount, aborted: true };
+        } else {
+          onBatchError?.(batch, message);
+        }
+        continue;
+      }
+
       onBatchError?.(batch, message);
       throw new Error(message);
     }
 
-    response.translations.forEach((translation, offset) => {
+    const translations = Array.isArray(response.translations) ? response.translations : [];
+    if (translations.length !== batch.length) {
+      if (batch.length > 1) {
+        const fallback = await runSingleTranslationFallback(batch, {
+          runId,
+          shouldContinue,
+          onBatchError,
+          errorMessage,
+          applyTranslation
+        });
+        translatedCount += fallback.translatedCount;
+        if (fallback.aborted) return { translatedCount, aborted: true };
+        continue;
+      }
+
+      onBatchError?.(batch, TRANSLATION_COUNT_MISMATCH_MESSAGE);
+      continue;
+    }
+
+    translations.forEach((translation, offset) => {
       const group = batch[offset];
       if (!group || !translation || !isActiveRun(runId)) return;
       translatedCount += applyTranslation(group, translation);
@@ -294,6 +333,51 @@ async function runTranslationBatches(groups, {
   }
 
   return { translatedCount, aborted: false };
+}
+
+async function runSingleTranslationFallback(groups, {
+  runId,
+  shouldContinue,
+  onBatchError,
+  errorMessage,
+  applyTranslation
+}) {
+  let translatedCount = 0;
+
+  for (const group of groups) {
+    if (!shouldContinue()) break;
+
+    const response = await sendRuntimeMessage({
+      type: "TRANSLATE_BATCH",
+      texts: [group.text],
+      options: pickRuntimeOptions(runtimeState.settings)
+    });
+
+    if (!response) return { translatedCount, aborted: true };
+
+    if (!response.ok) {
+      const message = response?.error || errorMessage;
+      onBatchError?.([group], message);
+      if (!isTranslationCountMismatchError(message)) throw new Error(message);
+      continue;
+    }
+
+    const translations = Array.isArray(response.translations) ? response.translations : [];
+    if (translations.length !== 1) {
+      onBatchError?.([group], TRANSLATION_COUNT_MISMATCH_MESSAGE);
+      continue;
+    }
+
+    const [translation] = translations;
+    if (!translation || !isActiveRun(runId)) continue;
+    translatedCount += applyTranslation(group, translation);
+  }
+
+  return { translatedCount, aborted: false };
+}
+
+function isTranslationCountMismatchError(message) {
+  return String(message || "").includes(TRANSLATION_COUNT_MISMATCH_MESSAGE);
 }
 
 async function translatePage(overrides = {}) {
@@ -418,10 +502,11 @@ function cloneMirrorBodyIntoPanes(root) {
   const targetPane = root.querySelector(MIRROR_SELECTORS.targetPane);
   if (!sourcePane || !targetPane) return;
 
+  const cloneContext = createMirrorCloneContext();
   Array.from(document.body.childNodes).forEach((node) => {
     if (node === root || shouldSkipMirrorCloneNode(node)) return;
-    sourcePane.appendChild(createSanitizedMirrorClone(node));
-    targetPane.appendChild(createSanitizedMirrorClone(node));
+    sourcePane.appendChild(createSanitizedMirrorClone(node, cloneContext));
+    targetPane.appendChild(createSanitizedMirrorClone(node, cloneContext));
   });
 }
 
@@ -430,31 +515,44 @@ function shouldSkipMirrorCloneNode(node) {
   return node.matches(MIRROR_SELECTORS.excludedClone);
 }
 
-function createSanitizedMirrorClone(node) {
+function createMirrorCloneContext() {
+  return {
+    nextNodeId: 1,
+    nodeIds: new WeakMap()
+  };
+}
+
+function createSanitizedMirrorClone(node, cloneContext) {
   const clone = node.cloneNode(true);
-  sanitizeMirrorClone(clone);
+  sanitizeMirrorClone(clone, node, cloneContext);
   return clone;
 }
 
-function sanitizeMirrorClone(root) {
-  if (root.nodeType === Node.ELEMENT_NODE && root.matches(MIRROR_SELECTORS.excludedClone)) {
-    root.remove();
+function sanitizeMirrorClone(cloneRoot, sourceRoot, cloneContext) {
+  sanitizeMirrorCloneNode(cloneRoot, sourceRoot, cloneContext);
+}
+
+function sanitizeMirrorCloneNode(cloneNode, sourceNode, cloneContext) {
+  if (cloneNode.nodeType === Node.ELEMENT_NODE && cloneNode.matches(MIRROR_SELECTORS.excludedClone)) {
+    cloneNode.remove();
     return;
   }
 
-  if (root.querySelectorAll) {
-    root.querySelectorAll(MIRROR_SELECTORS.excludedClone).forEach((node) => node.remove());
+  if (cloneNode.nodeType === Node.ELEMENT_NODE) {
+    sanitizeMirrorCloneElement(
+      cloneNode,
+      sourceNode?.nodeType === Node.ELEMENT_NODE ? sourceNode : null,
+      cloneContext
+    );
   }
-  const elements = root.nodeType === Node.ELEMENT_NODE
-    ? [root, ...root.querySelectorAll("*")]
-    : [];
 
-  elements.forEach((element) => {
-    sanitizeMirrorCloneElement(element);
+  const sourceChildren = Array.from(sourceNode?.childNodes || []);
+  Array.from(cloneNode.childNodes || []).forEach((child, index) => {
+    sanitizeMirrorCloneNode(child, sourceChildren[index], cloneContext);
   });
 }
 
-function sanitizeMirrorCloneElement(element) {
+function sanitizeMirrorCloneElement(element, sourceElement, cloneContext) {
   element.classList.remove(...MIRROR_TRANSIENT_CLASSES);
   MIRROR_TRANSIENT_ATTRIBUTES.forEach((attribute) => element.removeAttribute(attribute));
 
@@ -464,6 +562,26 @@ function sanitizeMirrorCloneElement(element) {
       element.removeAttribute(attribute.name);
     }
   });
+
+  if (!sourceElement) return;
+
+  element.setAttribute(MIRROR_CLONE_NODE_ID_ATTRIBUTE, getMirrorCloneNodeId(sourceElement, cloneContext));
+  markPositionedMirrorClone(element, sourceElement);
+}
+
+function getMirrorCloneNodeId(sourceElement, cloneContext) {
+  if (!cloneContext.nodeIds.has(sourceElement)) {
+    cloneContext.nodeIds.set(sourceElement, `${instanceId}-mirror-${cloneContext.nextNodeId++}`);
+  }
+
+  return cloneContext.nodeIds.get(sourceElement);
+}
+
+function markPositionedMirrorClone(element, sourceElement) {
+  const position = window.getComputedStyle(sourceElement).position;
+  if (position !== "fixed" && position !== "sticky") return;
+
+  element.setAttribute(MIRROR_POSITIONED_ATTRIBUTE, position);
 }
 
 function setupMirrorScrollSync() {
@@ -552,10 +670,11 @@ async function reopenSplitAfterNavigation(href) {
 function addMirrorPaneScrollListener(fromPane, toPane) {
   if (!fromPane || !toPane) return;
 
-  const onScroll = () => {
+  const onScroll = (event) => {
     if (!mirrorState.active) return;
     if (mirrorState.scrollSyncEnabled && Date.now() >= mirrorState.suppressScrollUntil) {
-      syncMirrorScroll(fromPane, toPane);
+      const syncedNestedScroll = syncMirrorNestedScroll(event.target, fromPane, toPane);
+      if (!syncedNestedScroll) syncMirrorScroll(fromPane, toPane);
     }
     scheduleMirrorTranslation(MIRROR_TRANSLATION_DELAY_MS.scroll);
   };
@@ -565,7 +684,7 @@ function addMirrorPaneScrollListener(fromPane, toPane) {
     scheduleMirrorTranslation(MIRROR_TRANSLATION_DELAY_MS.input);
   };
 
-  addMirrorPaneListener(fromPane, "scroll", onScroll, { passive: true });
+  addMirrorPaneListener(fromPane, "scroll", onScroll, { passive: true, capture: true });
   addMirrorPaneListener(fromPane, "wheel", onViewportInput, { passive: true });
   addMirrorPaneListener(fromPane, "touchmove", onViewportInput, { passive: true });
   addMirrorPaneListener(fromPane, "touchend", onViewportInput, { passive: true });
@@ -587,6 +706,49 @@ function syncMirrorScroll(fromPane, toPane) {
   } else {
     syncMirrorScrollByRatio(fromPane, toPane);
   }
+}
+
+function syncMirrorNestedScroll(fromTarget, fromPane, toPane) {
+  if (!(fromTarget instanceof Element) || fromTarget === fromPane || !fromPane.contains(fromTarget)) {
+    return false;
+  }
+  if (!isScrollableMirrorElement(fromTarget)) return false;
+
+  const nodeId = fromTarget.getAttribute(MIRROR_CLONE_NODE_ID_ATTRIBUTE);
+  if (!nodeId) return false;
+
+  const toTarget = toPane.querySelector(`[${MIRROR_CLONE_NODE_ID_ATTRIBUTE}="${CSS.escape(nodeId)}"]`);
+  if (!(toTarget instanceof Element) || !isScrollableMirrorElement(toTarget)) return false;
+
+  const fromMaxY = getElementMaxScrollY(fromTarget);
+  const toMaxY = getElementMaxScrollY(toTarget);
+  const fromMaxX = getElementMaxScrollX(fromTarget);
+  const toMaxX = getElementMaxScrollX(toTarget);
+  if (fromMaxY <= 0 && fromMaxX <= 0) return false;
+
+  beginMirrorScrollSuppression();
+  toTarget.scrollTo({
+    left: fromMaxX > 0 && toMaxX > 0
+      ? clamp(Math.round((fromTarget.scrollLeft / fromMaxX) * toMaxX), 0, toMaxX)
+      : toTarget.scrollLeft,
+    top: fromMaxY > 0 && toMaxY > 0
+      ? clamp(Math.round((fromTarget.scrollTop / fromMaxY) * toMaxY), 0, toMaxY)
+      : toTarget.scrollTop,
+    behavior: "auto"
+  });
+  return true;
+}
+
+function isScrollableMirrorElement(element) {
+  return getElementMaxScrollY(element) > 0 || getElementMaxScrollX(element) > 0;
+}
+
+function getElementMaxScrollY(element) {
+  return Math.max(0, element.scrollHeight - element.clientHeight);
+}
+
+function getElementMaxScrollX(element) {
+  return Math.max(0, element.scrollWidth - element.clientWidth);
 }
 
 function beginMirrorScrollSuppression() {
@@ -830,8 +992,32 @@ function isMirrorElementInViewport(element, pane) {
     rect.bottom >= paneRect.top - verticalPadding &&
     rect.top <= paneRect.bottom + verticalPadding &&
     rect.right >= paneRect.left &&
-    rect.left <= paneRect.right
+    rect.left <= paneRect.right &&
+    !isClippedByMirrorAncestor(element, rect, pane)
   ));
+}
+
+function isClippedByMirrorAncestor(element, rect, pane) {
+  const elementPosition = window.getComputedStyle(element).position;
+  if (elementPosition === "fixed") return false;
+
+  let current = element.parentElement;
+  while (current && current !== pane) {
+    const style = window.getComputedStyle(current);
+    const clipsX = ["hidden", "clip", "scroll", "auto"].includes(style.overflowX);
+    const clipsY = ["hidden", "clip", "scroll", "auto"].includes(style.overflowY);
+
+    if (clipsX || clipsY) {
+      const currentRect = current.getBoundingClientRect();
+      const outsideX = clipsX && (rect.right <= currentRect.left || rect.left >= currentRect.right);
+      const outsideY = clipsY && (rect.bottom <= currentRect.top || rect.top >= currentRect.bottom);
+      if (outsideX || outsideY) return true;
+    }
+
+    current = current.parentElement;
+  }
+
+  return false;
 }
 
 function createMirrorTextUnit(textNode) {
