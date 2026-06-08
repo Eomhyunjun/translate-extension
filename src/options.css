@@ -41,6 +41,12 @@ h2 {
   line-height: 1.4;
 }
 
+h3 {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
 p {
   margin-top: 8px;
   color: #64748b;
@@ -98,6 +104,51 @@ p {
   color: #1e3a8a;
   background: #eff6ff;
   font-size: 13px;
+}
+
+.shortcut-guide {
+  display: grid;
+  gap: 8px;
+  margin: 0 0 16px;
+  padding: 14px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  color: #334155;
+  background: #ffffff;
+}
+
+.shortcut-guide p {
+  margin-top: 2px;
+  font-size: 13px;
+}
+
+.shortcut-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.shortcut-keys {
+  display: inline-flex;
+  flex: none;
+  gap: 5px;
+}
+
+kbd {
+  min-width: 18px;
+  padding: 3px 6px;
+  border: 1px solid #cbd5e1;
+  border-bottom-color: #94a3b8;
+  border-radius: 5px;
+  color: #334155;
+  background: #f8fafc;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  font-weight: 700;
+  text-align: center;
 }
 
 .check {
@@ -272,7 +323,8 @@ button {
 
   .summary,
   .log-item,
-  .provider-fields {
+  .provider-fields,
+  .shortcut-guide {
     border-color: #334155;
     color: #cbd5e1;
     background: #1f2937;
@@ -285,6 +337,13 @@ button {
   }
 
   pre {
+    background: #0f172a;
+  }
+
+  kbd {
+    border-color: #475569;
+    border-bottom-color: #64748b;
+    color: #e5e7eb;
     background: #0f172a;
   }
 

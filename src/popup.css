@@ -87,6 +87,46 @@ button {
   margin-top: 4px;
 }
 
+.shortcut-guide {
+  display: grid;
+  gap: 6px;
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid #dbe3ef;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.shortcut-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: #475569;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.shortcut-keys {
+  display: inline-flex;
+  flex: none;
+  gap: 4px;
+}
+
+kbd {
+  min-width: 16px;
+  padding: 2px 5px;
+  border: 1px solid #cbd5e1;
+  border-bottom-color: #94a3b8;
+  border-radius: 5px;
+  color: #334155;
+  background: #f8fafc;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 10px;
+  font-weight: 700;
+  text-align: center;
+}
+
 .primary {
   border-color: #2563eb;
   color: #ffffff;
@@ -150,6 +190,22 @@ button {
     border-color: #334155;
     color: #e5e7eb;
     background: #1f2937;
+  }
+
+  .shortcut-guide {
+    border-color: #334155;
+    background: #1f2937;
+  }
+
+  .shortcut-row {
+    color: #cbd5e1;
+  }
+
+  kbd {
+    border-color: #475569;
+    border-bottom-color: #64748b;
+    color: #e5e7eb;
+    background: #0f172a;
   }
 
   .primary {
