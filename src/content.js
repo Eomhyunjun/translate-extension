@@ -86,7 +86,10 @@ const MIRROR_TRANSLATION_DELAY_MS = {
   input: 120,
   default: 160
 };
-const MIRROR_TRANSLATION_UNIT_LIMIT = 60;
+// Whole-page translation cap: the split view translates the full document in one pass
+// (top-first, rendered batch by batch), not just the viewport — fewer total requests than
+// re-translating on every scroll. Pages longer than this finish the rest as you scroll.
+const MIRROR_TRANSLATION_UNIT_LIMIT = 300;
 const MIRROR_SELECTORS = {
   sourcePane: ".bit-mirror-pane-source",
   targetPane: ".bit-mirror-pane-target",
@@ -95,13 +98,13 @@ const MIRROR_SELECTORS = {
 const MIRROR_TRANSIENT_CLASSES = ["bit-pending", "bit-failed", "bit-replaced"];
 const MIRROR_TRANSIENT_ATTRIBUTES = ["data-bit-error", "data-bit-translated-text", "data-bit-original-text"];
 const MIRROR_CLONE_NODE_ID_ATTRIBUTE = "data-bit-mirror-node-id";
-const MIRROR_POSITIONED_ATTRIBUTE = "data-bit-mirror-positioned";
 const TRANSLATION_COUNT_MISMATCH_MESSAGE = "Translation response did not include the expected number of translations.";
 const runtimeState = {
   activeRun: 0,
   settings: { ...DEFAULT_SETTINGS },
   autoTranslateTimer: null,
   isAutoTranslating: false,
+  autoTranslatePending: false,
   nextBlockId: 1,
   contextAlive: true,
   lastViewportSignature: "",
@@ -538,6 +541,17 @@ function sanitizeMirrorCloneNode(cloneNode, sourceNode, cloneContext) {
     return;
   }
 
+  // Drop fixed/sticky overlays (cookie banners, sticky chrome, floating widgets): inside a
+  // scrollable cloned pane they float, overlap content, and can't be interacted with.
+  if (
+    cloneNode.nodeType === Node.ELEMENT_NODE &&
+    sourceNode?.nodeType === Node.ELEMENT_NODE &&
+    isFixedOrStickyElement(sourceNode)
+  ) {
+    cloneNode.remove();
+    return;
+  }
+
   if (cloneNode.nodeType === Node.ELEMENT_NODE) {
     sanitizeMirrorCloneElement(
       cloneNode,
@@ -566,7 +580,6 @@ function sanitizeMirrorCloneElement(element, sourceElement, cloneContext) {
   if (!sourceElement) return;
 
   element.setAttribute(MIRROR_CLONE_NODE_ID_ATTRIBUTE, getMirrorCloneNodeId(sourceElement, cloneContext));
-  markPositionedMirrorClone(element, sourceElement);
 }
 
 function getMirrorCloneNodeId(sourceElement, cloneContext) {
@@ -577,11 +590,9 @@ function getMirrorCloneNodeId(sourceElement, cloneContext) {
   return cloneContext.nodeIds.get(sourceElement);
 }
 
-function markPositionedMirrorClone(element, sourceElement) {
-  const position = window.getComputedStyle(sourceElement).position;
-  if (position !== "fixed" && position !== "sticky") return;
-
-  element.setAttribute(MIRROR_POSITIONED_ATTRIBUTE, position);
+function isFixedOrStickyElement(element) {
+  const position = window.getComputedStyle(element).position;
+  return position === "fixed" || position === "sticky";
 }
 
 function setupMirrorScrollSync() {
@@ -899,25 +910,92 @@ async function translateMirrorViewport({ runId = runtimeState.activeRun } = {}) 
   }
 }
 
+// Mirror translates one unit per *block* (paragraph/heading/list-item), not per text
+// node, so inline emphasis (<sup>, <strong>, per-word <span>) can't fragment a sentence
+// into separately-translated pieces. Anchors stay per-text-node, so scroll-sync is intact.
+const MIRROR_BLOCK_SELECTOR =
+  "p, li, blockquote, h1, h2, h3, h4, h5, h6, summary, figcaption, caption, dt, dd, td, th, legend, [role='heading'], [role='listitem']";
+const MIRROR_INLINE_TAGS = new Set([
+  "SPAN", "A", "STRONG", "EM", "B", "I", "SMALL", "TIME", "MARK", "SUP", "SUB",
+  "CODE", "KBD", "ABBR", "CITE", "Q", "U", "S", "WBR", "BDI", "BDO", "DFN", "VAR",
+  "SAMP", "INS", "DEL", "LABEL", "BUTTON", "FONT"
+]);
+
 function collectMirrorTextUnits(root, currentSettings) {
-  const units = [];
-  if (!root?.ownerDocument?.defaultView) return units;
+  const unitsByBlock = new Map();
+  if (!root?.ownerDocument?.defaultView) return [];
 
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
-      if (!isTranslatableMirrorTextNode(node, root, currentSettings)) {
-        return NodeFilter.FILTER_REJECT;
-      }
-      return NodeFilter.FILTER_ACCEPT;
+      return isTranslatableMirrorTextNode(node, currentSettings)
+        ? NodeFilter.FILTER_ACCEPT
+        : NodeFilter.FILTER_REJECT;
     }
   });
 
   while (walker.nextNode()) {
-    const unit = createMirrorTextUnit(walker.currentNode);
-    if (unit) units.push(unit);
+    const block = findMirrorBlock(walker.currentNode.parentElement, root);
+    if (!block || unitsByBlock.has(block)) continue;
+    const textNodes = collectMirrorBlockTextNodes(block);
+    if (textNodes.length === 0) continue;
+    const text = normalizeText(textNodes.map((node) => node.nodeValue || "").join(""));
+    if (isUsefulText(text)) unitsByBlock.set(block, { element: block, textNodes, text });
   }
 
-  return units;
+  return Array.from(unitsByBlock.values());
+}
+
+function findMirrorBlock(element, root) {
+  if (!element || !root.contains(element)) return null;
+
+  const semantic = element.closest(MIRROR_BLOCK_SELECTOR);
+  if (semantic && root.contains(semantic)) return semantic;
+
+  let current = element;
+  while (current && current !== root) {
+    if (isBlockLevelElement(current)) return current;
+    current = current.parentElement;
+  }
+
+  return element;
+}
+
+function isBlockLevelElement(element) {
+  if (MIRROR_INLINE_TAGS.has(element.tagName)) return false;
+  const display = window.getComputedStyle(element).display;
+  return (
+    display === "block" ||
+    display === "flex" ||
+    display === "grid" ||
+    display === "list-item" ||
+    display === "table" ||
+    display === "table-cell" ||
+    display === "flow-root"
+  );
+}
+
+function isMirrorBlockBoundary(element) {
+  return element.matches(MIRROR_BLOCK_SELECTOR) || isBlockLevelElement(element);
+}
+
+// All text nodes that belong directly to `block` (descending through inline elements but
+// stopping at nested blocks, so a paragraph's text isn't merged with a child list/table).
+function collectMirrorBlockTextNodes(block) {
+  const textNodes = [];
+  const walker = document.createTreeWalker(block, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (node.nodeType === Node.TEXT_NODE) return NodeFilter.FILTER_ACCEPT;
+      if (node === block) return NodeFilter.FILTER_SKIP;
+      if (node.matches(EXCLUDED_SELECTOR) || isMirrorBlockBoundary(node)) return NodeFilter.FILTER_REJECT;
+      return NodeFilter.FILTER_SKIP;
+    }
+  });
+
+  while (walker.nextNode()) {
+    if (walker.currentNode.nodeType === Node.TEXT_NODE) textNodes.push(walker.currentNode);
+  }
+
+  return textNodes;
 }
 
 function collectMirrorAnchorUnits(root) {
@@ -946,14 +1024,13 @@ function findMirrorAnchorUnit(root, key, occurrence) {
   )) || null;
 }
 
-function isTranslatableMirrorTextNode(node, pane, currentSettings) {
+function isTranslatableMirrorTextNode(node, currentSettings) {
   if (mirrorState.textReplacements.has(node)) return false;
 
   const text = normalizeText(node.nodeValue || "");
   if (!isUsefulText(text)) return false;
   if (shouldSkipTranslatedText(text, currentSettings)) return false;
   if (!isValidMirrorTextParent(node.parentElement)) return false;
-  if (!isMirrorElementInViewport(node.parentElement, pane)) return false;
 
   return true;
 }
@@ -1020,16 +1097,6 @@ function isClippedByMirrorAncestor(element, rect, pane) {
   return false;
 }
 
-function createMirrorTextUnit(textNode) {
-  const element = textNode.parentElement;
-  if (!element) return null;
-  return {
-    textNode,
-    element,
-    text: normalizeText(textNode.nodeValue || "")
-  };
-}
-
 function createMirrorAnchorUnit(textNode, occurrenceByKey) {
   const element = textNode.parentElement;
   if (!element) return null;
@@ -1080,15 +1147,25 @@ function replaceMirrorTextUnits(units, translation) {
   ), 0);
 }
 
+// Put the whole block translation into its first text node and clear the rest, so inline
+// pieces (<sup>er</sup>, per-word spans) stop showing untranslated leftovers. Every text
+// node keeps its stored original, so the per-text-node scroll-sync anchors still match.
 function replaceMirrorTextUnit(unit, translation) {
-  const textNode = unit.textNode;
-  if (!textNode?.isConnected || mirrorState.textReplacements.has(textNode)) return false;
-  if (normalizeText(textNode.nodeValue || "") !== unit.text) return false;
+  const textNodes = unit.textNodes || [];
+  const primary = textNodes[0];
+  if (!primary?.isConnected || mirrorState.textReplacements.has(primary)) return false;
 
-  const originalText = textNode.nodeValue || "";
-  const translatedText = preserveTextNodeSpacing(originalText, translation);
-  mirrorState.textReplacements.set(textNode, { originalText, translatedText });
-  textNode.nodeValue = translatedText;
+  const currentText = normalizeText(textNodes.map((node) => node.nodeValue || "").join(""));
+  if (currentText !== unit.text) return false;
+
+  const normalizedTranslation = String(translation || "").trim();
+  textNodes.forEach((node, index) => {
+    if (!node.isConnected || mirrorState.textReplacements.has(node)) return;
+    const originalText = node.nodeValue || "";
+    const translatedText = index === 0 ? preserveTextNodeSpacing(originalText, normalizedTranslation) : "";
+    mirrorState.textReplacements.set(node, { originalText, translatedText });
+    node.nodeValue = translatedText;
+  });
   unit.element.classList?.add("bit-mirror-translated-text");
   return true;
 }
@@ -1136,32 +1213,40 @@ function startAutoMode() {
 function stopAutoMode() {
   window.clearTimeout(runtimeState.autoTranslateTimer);
   runtimeState.autoTranslateTimer = null;
+  runtimeState.autoTranslatePending = false;
 }
 
 async function translateVisibleIfEnabled() {
-  if (
-    !runtimeState.contextAlive ||
-    !runtimeState.settings.enabled ||
-    runtimeState.isAutoTranslating
-  ) {
-    return;
-  }
+  if (!runtimeState.contextAlive || !runtimeState.settings.enabled) return;
   if (mirrorState.active) {
     scheduleMirrorTranslation(MIRROR_TRANSLATION_DELAY_MS.retry);
     return;
   }
+  if (runtimeState.isAutoTranslating) {
+    // A viewport change arrived mid-flight; remember it and re-run once the in-flight
+    // pass finishes so the newly scrolled-in content isn't silently dropped.
+    runtimeState.autoTranslatePending = true;
+    return;
+  }
   const signature = getViewportSignature();
   if (signature && signature === runtimeState.lastViewportSignature) return;
-  runtimeState.lastViewportSignature = signature;
   runtimeState.isAutoTranslating = true;
+  let translatedOk = false;
   try {
     await translatePage({ ...runtimeState.settings, translateScope: "viewport", enabled: true, auto: true });
+    translatedOk = true;
   } catch (error) {
     if (!isContextInvalidatedError(error)) {
       console.warn("Auto translation failed", error);
     }
   } finally {
     runtimeState.isAutoTranslating = false;
+    // Commit the signature only on success so a failed pass retries on the next trigger.
+    if (translatedOk) runtimeState.lastViewportSignature = signature;
+    if (runtimeState.autoTranslatePending) {
+      runtimeState.autoTranslatePending = false;
+      scheduleAutoTranslate();
+    }
   }
 }
 
@@ -1171,7 +1256,7 @@ function getViewportSignature() {
     translateScope: "viewport",
     viewMode: runtimeState.settings.viewMode
   });
-  return blocks
+  return `${blocks.length}|` + blocks
     .slice(0, 24)
     .map((item) => `${ensureBlockId(item.element)}:${item.text.slice(0, 80)}`)
     .join("|");
@@ -1340,23 +1425,38 @@ function getTextContainer(element) {
   return element;
 }
 
+const BLOCK_SENTENCE_TAGS = ["DIV", "SECTION", "ARTICLE", "MAIN", "HEADER", "FOOTER", "ASIDE"];
+
+function getDirectText(element) {
+  return Array.from(element.childNodes)
+    .filter((node) => node.nodeType === Node.TEXT_NODE)
+    .map((node) => normalizeText(node.nodeValue || ""))
+    .join(" ")
+    .trim();
+}
+
 function isStandaloneTextContainer(element) {
   const tag = element.tagName;
   if (["A", "SPAN", "STRONG", "EM", "B", "I", "SMALL", "TIME", "MARK"].includes(tag)) {
     return true;
   }
 
-  if (!["DIV", "SECTION", "ARTICLE", "MAIN", "HEADER", "FOOTER", "ASIDE"].includes(tag)) {
+  if (!BLOCK_SENTENCE_TAGS.includes(tag)) {
     return false;
   }
 
-  const directText = Array.from(element.childNodes)
-    .filter((node) => node.nodeType === Node.TEXT_NODE)
-    .map((node) => normalizeText(node.nodeValue || ""))
-    .join(" ")
-    .trim();
+  return getDirectText(element).length >= 8;
+}
 
-  return directText.length >= 8;
+// A non-semantic block (e.g. <div>) that carries its own sentence text directly —
+// used to absorb inline links/emphasis into the surrounding sentence rather than
+// letting them fragment into standalone word-level translation units.
+function hasOwnSentenceText(element) {
+  return BLOCK_SENTENCE_TAGS.includes(element.tagName) && getDirectText(element).length >= 8;
+}
+
+function isInlineTextElement(element) {
+  return element.matches("a, button, span[data-as='p'], strong, em, b, i, small, time, mark, [role='link'], [role='button']");
 }
 
 function isTranslatableElement(element) {
@@ -1438,10 +1538,16 @@ function isClippedByAncestor(element, rect) {
 }
 
 function hasTranslatableAncestor(element) {
+  const inlineCandidate = isInlineTextElement(element);
   let current = element.parentElement;
   while (current && current !== document.body) {
     if (current.classList?.contains("bit-translation")) return true;
     if (current.matches?.(TEXT_CONTAINER_SELECTOR) && !isNestedListItem(element, current)) return true;
+    // Inline link/emphasis embedded in a non-semantic sentence block → absorb into that
+    // block so the sentence stays one unit instead of fragmenting into words.
+    if (inlineCandidate && hasOwnSentenceText(current) && !isNestedListItem(element, current)) {
+      return true;
+    }
     const currentText = normalizeText(current.innerText || current.textContent || "");
     if (
       currentText.length >= 12 &&

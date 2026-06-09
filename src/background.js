@@ -568,12 +568,54 @@ function buildMyMemoryTranslateUrl(text, source, target) {
   return url.toString();
 }
 
+const RETRYABLE_HTTP_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+const FETCH_MAX_RETRIES = 2;
+const FETCH_BASE_RETRY_DELAY_MS = 500;
+const FETCH_MAX_RETRY_DELAY_MS = 8000;
+
+// Transient provider failures (rate limits, 5xx, dropped connections) recover on a short
+// exponential backoff, so they don't surface as "translation failed". Non-retryable
+// responses (auth, bad request, …) still fail fast since a retry can't help.
 async function fetchJsonOrThrow(resource, init, providerLabel) {
-  const response = await fetch(resource, init);
-  if (!response.ok) {
+  for (let attempt = 0; ; attempt += 1) {
+    let response;
+    try {
+      response = await fetch(resource, init);
+    } catch (error) {
+      if (attempt >= FETCH_MAX_RETRIES) throw error;
+      await delay(getRetryDelay(attempt, null));
+      continue;
+    }
+
+    if (response.ok) return response.json();
+
+    if (RETRYABLE_HTTP_STATUSES.has(response.status) && attempt < FETCH_MAX_RETRIES) {
+      await delay(getRetryDelay(attempt, response.headers.get("Retry-After")));
+      continue;
+    }
+
     throw new Error(`${providerLabel} request failed: ${response.status}`);
   }
-  return response.json();
+}
+
+function getRetryDelay(attempt, retryAfterHeader) {
+  const headerMs = parseRetryAfterMs(retryAfterHeader);
+  if (headerMs != null) return Math.min(headerMs, FETCH_MAX_RETRY_DELAY_MS);
+  const backoffMs = FETCH_BASE_RETRY_DELAY_MS * (2 ** attempt);
+  const jitterMs = Math.floor(Math.random() * 250);
+  return Math.min(backoffMs + jitterMs, FETCH_MAX_RETRY_DELAY_MS);
+}
+
+function parseRetryAfterMs(value) {
+  if (!value) return null;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const dateMs = Date.parse(value);
+  return Number.isFinite(dateMs) ? Math.max(0, dateMs - Date.now()) : null;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function translateWithGoogle(texts, settings) {
