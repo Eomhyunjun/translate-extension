@@ -96,6 +96,8 @@ const TRANSLATION_ITEM_RESPONSE_KEYS = Object.freeze([
   "text",
   "output"
 ]);
+const MAX_TRANSLATION_BATCH_SIZE = 50;
+const MAX_TRANSLATION_TEXT_LENGTH = 3000;
 
 chrome.runtime.onInstalled.addListener(async () => {
   const stored = await chrome.storage.sync.get(Object.keys(DEFAULT_SETTINGS));
@@ -319,7 +321,7 @@ function sanitizeSplitOptions(options = {}) {
   safe.displayMode = ALLOWED_SPLIT_DISPLAY_MODES.has(input.displayMode) ? input.displayMode : "replace";
   safe.translateScope = ALLOWED_SPLIT_SCOPES.has(input.translateScope) ? input.translateScope : DEFAULT_SETTINGS.translateScope;
   if (typeof input.skipTranslated === "boolean") safe.skipTranslated = input.skipTranslated;
-  if (Number.isFinite(Number(input.batchSize))) safe.batchSize = clamp(Number(input.batchSize), 1, 20);
+  if (Number.isFinite(Number(input.batchSize))) safe.batchSize = clamp(Number(input.batchSize), 1, MAX_TRANSLATION_BATCH_SIZE);
   safe.enabled = true;
 
   return safe;
@@ -381,6 +383,7 @@ async function translateBatch(texts, options = {}) {
 
   try {
     const result = await translateBatchWithProvider(texts, settings);
+    result.translations = dropEchoedTranslations(result.translations, texts, settings);
     await recordTranslationLog({
       ...requestMeta,
       status: "success",
@@ -489,10 +492,10 @@ async function recordTranslationLog(entry, settings) {
 function normalizeTexts(texts) {
   if (!Array.isArray(texts)) return [];
   return texts
-    .slice(0, 20)
+    .slice(0, MAX_TRANSLATION_BATCH_SIZE)
     .map((text) => String(text || "").replace(/\s+/g, " ").trim())
     .filter((text) => text.length > 0)
-    .map((text) => text.slice(0, 1600));
+    .map((text) => text.slice(0, MAX_TRANSLATION_TEXT_LENGTH));
 }
 
 function sanitizeOptions(options = {}) {
@@ -618,13 +621,28 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// Keyless REST providers (Google, MyMemory) translate one text per request. Settle the
+// requests independently so a single failed or empty response doesn't discard the rest of
+// the batch: failed items become null (the content script keeps the original text and can
+// retry later) while every other text still renders. Order and length are preserved so the
+// caller can line texts up with translations. Only if every item failed is the batch treated
+// as an error so it surfaces instead of silently translating nothing.
+function settleTranslations(results, providerLabel) {
+  const translations = results.map((result) => (result.status === "fulfilled" ? result.value : null));
+  if (translations.every((value) => value == null)) {
+    const firstRejection = results.find((result) => result.status === "rejected");
+    throw firstRejection?.reason instanceof Error
+      ? firstRejection.reason
+      : new Error(`${providerLabel} request failed`);
+  }
+  return translations;
+}
+
 async function translateWithGoogle(texts, settings) {
   const source = settings.sourceLang === "auto" ? "auto" : normalizeGoogleLang(settings.sourceLang);
   const target = normalizeGoogleLang(settings.targetLang);
 
-  // One request per text, but issued in parallel: Promise.all preserves input
-  // order and rejects on the first failure, matching the old sequential loop.
-  const translations = await Promise.all(texts.map(async (text) => {
+  const results = await Promise.allSettled(texts.map(async (text) => {
     const payload = await fetchJsonOrThrow(
       buildGoogleTranslateUrl(text, source, target),
       undefined,
@@ -633,23 +651,23 @@ async function translateWithGoogle(texts, settings) {
     const translated = Array.isArray(payload?.[0])
       ? payload[0].map((part) => part?.[0] || "").join("")
       : "";
-    return cleanTranslation(translated);
+    return cleanTranslation(translated) || null;
   }));
 
-  return { translations };
+  return { translations: settleTranslations(results, "Google Translate") };
 }
 
 async function translateWithMyMemory(texts, settings) {
   const source = settings.sourceLang === "auto" ? "en" : settings.sourceLang;
   const target = settings.targetLang;
 
-  const translations = await Promise.all(texts.map(async (text) => {
+  const results = await Promise.allSettled(texts.map(async (text) => {
     const payload = await fetchJsonOrThrow(buildMyMemoryTranslateUrl(text, source, target), undefined, "MyMemory");
     const translated = payload?.responseData?.translatedText;
-    return cleanTranslation(translated || "");
+    return cleanTranslation(translated || "") || null;
   }));
 
-  return { translations };
+  return { translations: settleTranslations(results, "MyMemory") };
 }
 
 async function translateWithMicrosoft(texts, settings) {
@@ -971,6 +989,43 @@ function buildTranslationPrompt(targetLang, sourceLang, texts) {
     expected_count: texts.length,
     texts
   });
+}
+
+// Non-Latin targets have a distinct script, so a real translation always contains some of
+// it. We use that to recognise an *untranslated echo* (the provider — usually a weak LLM —
+// just handed the source text back).
+const TARGET_SCRIPT_PATTERNS = {
+  ko: /[가-힯]/,
+  ja: /[぀-ヿ㐀-鿿]/,
+  "zh-CN": /[㐀-鿿]/,
+  "zh-TW": /[㐀-鿿]/
+};
+
+// A provider that returns the source text verbatim hasn't translated it; rendering that just
+// shows the original twice ("원문 그대로"). For a non-Latin target we can detect it reliably —
+// same text, multiple words, and no target-script character — and null it so the content
+// script keeps the original in place and retries later instead of showing a fake translation.
+function dropEchoedTranslations(translations, texts, settings) {
+  if (!Array.isArray(translations)) return translations;
+  const targetPattern = TARGET_SCRIPT_PATTERNS[settings.targetLang];
+  if (!targetPattern) return translations;
+
+  return translations.map((translation, index) => {
+    if (translation == null) return translation;
+    const source = texts[index] || "";
+    if (
+      normalizeEcho(translation) === normalizeEcho(source) &&
+      String(source).trim().split(/\s+/).length >= 2 &&
+      !targetPattern.test(translation)
+    ) {
+      return null;
+    }
+    return translation;
+  });
+}
+
+function normalizeEcho(text) {
+  return String(text || "").replace(/[​-‍⁠﻿]/g, "").replace(/\s+/g, " ").trim();
 }
 
 function cleanTranslation(value) {

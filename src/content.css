@@ -1,5 +1,6 @@
 .bit-translation {
   box-sizing: border-box;
+  position: relative;
   margin: 0.35em 0 0.9em;
   padding: 0.62em 0.78em;
   border-left: 3px solid #2563eb;
@@ -8,6 +9,37 @@
   font: inherit;
   line-height: 1.62;
   white-space: pre-wrap;
+}
+
+.bit-retranslate {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 1.55em;
+  height: 1.55em;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid color-mix(in srgb, #2563eb 35%, transparent);
+  border-radius: 5px;
+  background: color-mix(in srgb, #2563eb 12%, #fff);
+  color: #1d4ed8;
+  font: inherit;
+  font-size: 0.92em;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s ease, background 0.12s ease;
+}
+
+.bit-translation:hover .bit-retranslate,
+.bit-retranslate:focus-visible {
+  opacity: 1;
+}
+
+.bit-retranslate:hover {
+  background: color-mix(in srgb, #2563eb 24%, #fff);
 }
 
 .bit-pending {
@@ -21,7 +53,7 @@
 }
 
 .bit-failed::after {
-  content: "Translation failed";
+  content: "번역 실패";
   display: block;
   margin-top: 0.25em;
   color: #b91c1c;
@@ -116,8 +148,21 @@
 }
 
 .bit-mirror-pane .bit-mirror-translated-text {
+  position: relative;
   outline: 1px solid rgba(37, 99, 235, 0.2);
   outline-offset: 1px;
+}
+
+.bit-retranslate-mirror {
+  top: 2px;
+  right: 2px;
+  font-size: 0.8em;
+  z-index: 1;
+}
+
+.bit-mirror-translated-text:hover > .bit-retranslate-mirror,
+.bit-retranslate-mirror:focus-visible {
+  opacity: 1;
 }
 
 @media (max-width: 760px) {

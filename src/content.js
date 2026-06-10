@@ -60,6 +60,7 @@ const TEXT_CONTAINER_SELECTOR = [
 
 const EXCLUDED_SELECTOR = [
   ".bit-translation",
+  ".bit-retranslate",
   ".bit-hidden-original",
   "[hidden]",
   "[aria-hidden='true']",
@@ -84,12 +85,15 @@ const MIRROR_TRANSLATION_DELAY_MS = {
   retry: 80,
   scroll: 90,
   input: 120,
+  errorRetry: 1200,
   default: 160
 };
-// Whole-page translation cap: the split view translates the full document in one pass
-// (top-first, rendered batch by batch), not just the viewport — fewer total requests than
-// re-translating on every scroll. Pages longer than this finish the rest as you scroll.
-const MIRROR_TRANSLATION_UNIT_LIMIT = 300;
+const MAX_TRANSLATION_BATCH_SIZE = 50;
+const MAX_TRANSLATION_TEXT_LENGTH = 3000;
+const FIRST_TRANSLATION_BATCH_SIZE = 2;
+const MIRROR_TRANSLATION_BATCH_SIZE = 2;
+// Split view translates in progressive top-to-bottom passes.
+const MIRROR_TRANSLATION_UNIT_LIMIT = 80;
 const MIRROR_SELECTORS = {
   sourcePane: ".bit-mirror-pane-source",
   targetPane: ".bit-mirror-pane-target",
@@ -126,6 +130,7 @@ const mirrorState = {
   originalBodyOverflow: "",
   translationCache: new Map(),
   textReplacements: new Map(),
+  failedTranslationKeys: new Set(),
   cleanupHandlers: []
 };
 
@@ -171,6 +176,7 @@ function initializeContentScript() {
   addDomListener(window, "touchend", handlePossibleViewportChange, { passive: true });
   addDomListener(window, "keyup", handlePossibleViewportChange);
   addDomListener(window, "resize", handlePossibleViewportChange, { passive: true });
+  addDomListener(document, "click", handleRetranslateClick, true);
 
   chrome.runtime.onMessage.addListener(handleRuntimeMessage);
   runtimeState.cleanupHandlers.push(() => chrome.runtime.onMessage.removeListener(handleRuntimeMessage));
@@ -263,79 +269,119 @@ function mergeRuntimeSettings(overrides) {
 // many items it rendered, which is summed into the returned `translatedCount`.
 async function runTranslationBatches(groups, {
   runId,
+  batchSize: requestedBatchSize,
   shouldContinue = () => isActiveRun(runId),
   onBatchStart,
   onBatchError,
   errorMessage = "Translation failed",
   applyTranslation
 }) {
-  const batchSize = getTranslationBatchSize(runtimeState.settings);
+  const batchSize = normalizeTranslationBatchSize(requestedBatchSize ?? runtimeState.settings.batchSize);
   let translatedCount = 0;
+  let failedCount = 0;
+  let index = 0;
 
-  for (let index = 0; index < groups.length; index += batchSize) {
-    if (!shouldContinue()) break;
-
-    const batch = groups.slice(index, index + batchSize);
-    onBatchStart?.(batch);
-
-    const response = await sendRuntimeMessage({
-      type: "TRANSLATE_BATCH",
-      texts: batch.map((group) => group.text),
-      options: pickRuntimeOptions(runtimeState.settings)
+  if (groups.length > 0 && batchSize > FIRST_TRANSLATION_BATCH_SIZE && shouldContinue()) {
+    const firstBatchSize = Math.min(FIRST_TRANSLATION_BATCH_SIZE, groups.length);
+    const result = await runTranslationBatch(groups.slice(0, firstBatchSize), {
+      runId,
+      shouldContinue,
+      onBatchStart,
+      onBatchError,
+      errorMessage,
+      applyTranslation
     });
 
-    if (!response) return { translatedCount, aborted: true };
+    translatedCount += result.translatedCount;
+    failedCount += result.failedCount || 0;
+    if (result.aborted) return { translatedCount, failedCount, aborted: true };
+    index = firstBatchSize;
+  }
 
-    if (!response.ok) {
-      const message = response?.error || errorMessage;
-      if (isTranslationCountMismatchError(message)) {
-        if (batch.length > 1) {
-          const fallback = await runSingleTranslationFallback(batch, {
-            runId,
-            shouldContinue,
-            onBatchError,
-            errorMessage,
-            applyTranslation
-          });
-          translatedCount += fallback.translatedCount;
-          if (fallback.aborted) return { translatedCount, aborted: true };
-        } else {
-          onBatchError?.(batch, message);
-        }
-        continue;
-      }
+  for (; index < groups.length; index += batchSize) {
+    if (!shouldContinue()) break;
 
-      onBatchError?.(batch, message);
-      throw new Error(message);
-    }
+    const result = await runTranslationBatch(groups.slice(index, index + batchSize), {
+      runId,
+      shouldContinue,
+      onBatchStart,
+      onBatchError,
+      errorMessage,
+      applyTranslation
+    });
 
-    const translations = Array.isArray(response.translations) ? response.translations : [];
-    if (translations.length !== batch.length) {
+    translatedCount += result.translatedCount;
+    failedCount += result.failedCount || 0;
+    if (result.aborted) return { translatedCount, failedCount, aborted: true };
+  }
+
+  return { translatedCount, failedCount, aborted: false };
+}
+
+async function runTranslationBatch(batch, {
+  runId,
+  shouldContinue,
+  onBatchStart,
+  onBatchError,
+  errorMessage,
+  applyTranslation
+}) {
+  onBatchStart?.(batch);
+
+  const response = await sendRuntimeMessage({
+    type: "TRANSLATE_BATCH",
+    texts: batch.map((group) => group.text),
+    options: pickRuntimeOptions(runtimeState.settings)
+  });
+
+  if (!response) return { translatedCount: 0, failedCount: 0, aborted: true };
+
+  if (!response.ok) {
+    const message = response?.error || errorMessage;
+    if (isTranslationCountMismatchError(message)) {
       if (batch.length > 1) {
-        const fallback = await runSingleTranslationFallback(batch, {
+        return runSingleTranslationFallback(batch, {
           runId,
           shouldContinue,
           onBatchError,
           errorMessage,
           applyTranslation
         });
-        translatedCount += fallback.translatedCount;
-        if (fallback.aborted) return { translatedCount, aborted: true };
-        continue;
       }
 
-      onBatchError?.(batch, TRANSLATION_COUNT_MISMATCH_MESSAGE);
-      continue;
+      onBatchError?.(batch, message);
+      return { translatedCount: 0, failedCount: batch.length, aborted: false };
     }
 
-    translations.forEach((translation, offset) => {
-      const group = batch[offset];
-      if (!group || !translation || !isActiveRun(runId)) return;
-      translatedCount += applyTranslation(group, translation);
-    });
+    onBatchError?.(batch, message);
+    if (isFatalTranslationError(message)) throw new Error(message);
+    return { translatedCount: 0, failedCount: batch.length, aborted: shouldStopAfterBatchError(message) };
   }
 
-  return { translatedCount, aborted: false };
+  const translations = Array.isArray(response.translations) ? response.translations : [];
+  if (translations.length !== batch.length) {
+    if (batch.length > 1) {
+      return runSingleTranslationFallback(batch, {
+        runId,
+        shouldContinue,
+        onBatchError,
+        errorMessage,
+        applyTranslation
+      });
+    }
+
+    onBatchError?.(batch, TRANSLATION_COUNT_MISMATCH_MESSAGE);
+    return { translatedCount: 0, failedCount: batch.length, aborted: false };
+  }
+
+  let translatedCount = 0;
+  translations.forEach((translation, offset) => {
+    const group = batch[offset];
+    if (!group || translation == null || !shouldContinue() || !isActiveRun(runId)) return;
+    translatedCount += applyTranslation(group, translation);
+  });
+
+  return { translatedCount, failedCount: 0, aborted: false };
 }
 
 async function runSingleTranslationFallback(groups, {
@@ -346,6 +392,7 @@ async function runSingleTranslationFallback(groups, {
   applyTranslation
 }) {
   let translatedCount = 0;
+  let failedCount = 0;
 
   for (const group of groups) {
     if (!shouldContinue()) break;
@@ -356,31 +403,60 @@ async function runSingleTranslationFallback(groups, {
       options: pickRuntimeOptions(runtimeState.settings)
     });
 
-    if (!response) return { translatedCount, aborted: true };
+    if (!response) return { translatedCount, failedCount, aborted: true };
 
     if (!response.ok) {
       const message = response?.error || errorMessage;
       onBatchError?.([group], message);
-      if (!isTranslationCountMismatchError(message)) throw new Error(message);
+      if (!isTranslationCountMismatchError(message) && isFatalTranslationError(message)) {
+        throw new Error(message);
+      }
+      failedCount += 1;
+      if (shouldStopAfterBatchError(message)) return { translatedCount, failedCount, aborted: true };
       continue;
     }
 
     const translations = Array.isArray(response.translations) ? response.translations : [];
     if (translations.length !== 1) {
       onBatchError?.([group], TRANSLATION_COUNT_MISMATCH_MESSAGE);
+      failedCount += 1;
       continue;
     }
 
     const [translation] = translations;
-    if (!translation || !isActiveRun(runId)) continue;
+    if (translation == null || !isActiveRun(runId)) continue;
     translatedCount += applyTranslation(group, translation);
   }
 
-  return { translatedCount, aborted: false };
+  return { translatedCount, failedCount, aborted: false };
 }
 
 function isTranslationCountMismatchError(message) {
   return String(message || "").includes(TRANSLATION_COUNT_MISMATCH_MESSAGE);
+}
+
+function isFatalTranslationError(message) {
+  const text = String(message || "").toLowerCase();
+  return (
+    text.includes("api key is missing") ||
+    text.includes("request failed: 400") ||
+    text.includes("request failed: 401") ||
+    text.includes("request failed: 403") ||
+    text.includes("request failed: 404")
+  );
+}
+
+function shouldStopAfterBatchError(message) {
+  const text = String(message || "").toLowerCase();
+  return (
+    text.includes("request failed: 408") ||
+    text.includes("request failed: 429") ||
+    text.includes("request failed: 500") ||
+    text.includes("request failed: 502") ||
+    text.includes("request failed: 503") ||
+    text.includes("request failed: 504") ||
+    text.includes("failed to fetch")
+  );
 }
 
 async function translatePage(overrides = {}) {
@@ -405,7 +481,7 @@ async function translatePage(overrides = {}) {
   if (blocks.length === 0) return { translatedCount: 0, skippedCount: 0 };
 
   const groups = groupBlocksByText(blocks);
-  const { translatedCount } = await runTranslationBatches(groups, {
+  const { translatedCount, failedCount } = await runTranslationBatches(groups, {
     runId,
     onBatchStart: (batch) => markPending(batch.flatMap((group) => group.blocks)),
     onBatchError: (batch, message) => markFailed(batch.flatMap((group) => group.blocks), message),
@@ -415,7 +491,7 @@ async function translatePage(overrides = {}) {
     }
   });
 
-  return { translatedCount, skippedCount: blocks.length - translatedCount };
+  return { translatedCount, failedCount, skippedCount: Math.max(0, blocks.length - translatedCount - failedCount) };
 }
 
 async function startInPageSplit(overrides = {}) {
@@ -881,33 +957,63 @@ async function translateMirrorViewport({ runId = runtimeState.activeRun } = {}) 
 
   mirrorState.isTranslating = true;
   mirrorState.needsTranslation = false;
+  let shouldContinueAfterPass = false;
+  let madeProgress = false;
+  let followUpDelay = MIRROR_TRANSLATION_DELAY_MS.retry;
 
   try {
-    const units = collectMirrorTextUnits(mirrorState.targetPane, runtimeState.settings).slice(0, MIRROR_TRANSLATION_UNIT_LIMIT);
+    const allUnits = collectMirrorTextUnits(mirrorState.targetPane, runtimeState.settings);
+    const pendingUnits = allUnits.filter((unit) => !isFailedMirrorUnit(unit, runtimeState.settings));
+    const units = selectMirrorTranslationUnits(pendingUnits);
     if (units.length === 0) return { translatedCount: 0, skippedCount: 0 };
+    shouldContinueAfterPass = pendingUnits.length > units.length;
 
     mirrorState.lastViewportSignature = getMirrorViewportSignature();
     const { translatedCount: cachedCount, missingGroups } = collectMissingMirrorTranslationGroups(units, runtimeState.settings);
-    const { translatedCount: batchCount } = await runTranslationBatches(missingGroups, {
+    const { translatedCount: batchCount, failedCount, aborted } = await runTranslationBatches(missingGroups, {
       runId,
+      batchSize: MIRROR_TRANSLATION_BATCH_SIZE,
       shouldContinue: () => isActiveRun(runId) && mirrorState.active,
+      onBatchError: (batch, message) => markMirrorTranslationFailed(batch, message),
       errorMessage: "Mirror translation failed",
       applyTranslation: (group, translation) => {
         const normalizedTranslation = String(translation);
         mirrorState.translationCache.set(group.key, normalizedTranslation);
+        mirrorState.failedTranslationKeys.delete(group.key);
         return replaceMirrorTextUnits(group.units, normalizedTranslation);
       }
     });
 
     const nextTranslatedCount = cachedCount + batchCount;
+    if (aborted && nextTranslatedCount > 0) {
+      shouldContinueAfterPass = true;
+      followUpDelay = MIRROR_TRANSLATION_DELAY_MS.errorRetry;
+    }
+    madeProgress = nextTranslatedCount > 0 || (failedCount > 0 && !aborted);
     return { translatedCount: nextTranslatedCount, skippedCount: units.length - nextTranslatedCount };
   } finally {
     mirrorState.isTranslating = false;
-    if (mirrorState.needsTranslation && mirrorState.active && isActiveRun(runId)) {
+    if ((mirrorState.needsTranslation || (shouldContinueAfterPass && madeProgress)) && mirrorState.active && isActiveRun(runId)) {
       mirrorState.needsTranslation = false;
-      scheduleMirrorTranslation(MIRROR_TRANSLATION_DELAY_MS.retry);
+      scheduleMirrorTranslation(followUpDelay);
     }
   }
+}
+
+function selectMirrorTranslationUnits(units) {
+  return units.slice(0, MIRROR_TRANSLATION_UNIT_LIMIT);
+}
+
+function isFailedMirrorUnit(unit, currentSettings) {
+  return mirrorState.failedTranslationKeys.has(translationCacheKey(unit.text, currentSettings));
+}
+
+function markMirrorTranslationFailed(groups, message) {
+  const retryable = shouldStopAfterBatchError(message);
+  groups.forEach((group) => {
+    if (group?.key && !retryable) mirrorState.failedTranslationKeys.add(group.key);
+    group?.units?.forEach((unit) => unit.element.classList?.add("bit-failed"));
+  });
 }
 
 // Mirror translates one unit per *block* (paragraph/heading/list-item), not per text
@@ -922,7 +1028,8 @@ const MIRROR_INLINE_TAGS = new Set([
 ]);
 
 function collectMirrorTextUnits(root, currentSettings) {
-  const unitsByBlock = new Map();
+  const seenBlocks = new Set();
+  const units = [];
   if (!root?.ownerDocument?.defaultView) return [];
 
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
@@ -935,14 +1042,80 @@ function collectMirrorTextUnits(root, currentSettings) {
 
   while (walker.nextNode()) {
     const block = findMirrorBlock(walker.currentNode.parentElement, root);
-    if (!block || unitsByBlock.has(block)) continue;
+    if (!block || seenBlocks.has(block)) continue;
+    seenBlocks.add(block);
     const textNodes = collectMirrorBlockTextNodes(block);
     if (textNodes.length === 0) continue;
-    const text = normalizeText(textNodes.map((node) => node.nodeValue || "").join(""));
-    if (isUsefulText(text)) unitsByBlock.set(block, { element: block, textNodes, text });
+    const blockUnits = createMirrorBlockTranslationUnits(block, textNodes);
+    if (blockUnits.length > 0) units.push(...blockUnits);
   }
 
-  return Array.from(unitsByBlock.values());
+  return units;
+}
+
+function createMirrorBlockTranslationUnits(element, textNodes) {
+  const text = normalizeText(textNodes.map((node) => node.nodeValue || "").join(""));
+  if (isUsefulText(text)) return [{ element, textNodes, text }];
+  if (text.length <= MAX_TRANSLATION_TEXT_LENGTH) return [];
+
+  return splitMirrorTextNodesIntoUnits(element, expandLongMirrorTextNodes(textNodes));
+}
+
+function splitMirrorTextNodesIntoUnits(element, textNodes) {
+  const units = [];
+  let currentNodes = [];
+  let currentParts = [];
+
+  const flush = () => {
+    const text = normalizeText(currentParts.join(""));
+    if (isUsefulText(text)) units.push({ element, textNodes: currentNodes, text });
+    currentNodes = [];
+    currentParts = [];
+  };
+
+  textNodes.forEach((node) => {
+    const value = node.nodeValue || "";
+    const nextText = normalizeText(currentParts.concat(value).join(""));
+    if (currentNodes.length > 0 && nextText.length > MAX_TRANSLATION_TEXT_LENGTH) {
+      flush();
+    }
+    currentNodes.push(node);
+    currentParts.push(value);
+  });
+
+  flush();
+  return units;
+}
+
+function expandLongMirrorTextNodes(textNodes) {
+  return textNodes.flatMap((node) => splitLongMirrorTextNode(node));
+}
+
+function splitLongMirrorTextNode(node) {
+  const value = node.nodeValue || "";
+  if (normalizeText(value).length <= MAX_TRANSLATION_TEXT_LENGTH) return [node];
+
+  const parts = splitLongMirrorTextValue(value);
+  if (parts.length <= 1) return [node];
+
+  const newNodes = parts.map((part) => node.ownerDocument.createTextNode(part));
+  node.replaceWith(...newNodes);
+  return newNodes;
+}
+
+function splitLongMirrorTextValue(value) {
+  const parts = [];
+  let remaining = value;
+
+  while (normalizeText(remaining).length > MAX_TRANSLATION_TEXT_LENGTH) {
+    let splitAt = remaining.lastIndexOf(" ", MAX_TRANSLATION_TEXT_LENGTH);
+    if (splitAt < MAX_TRANSLATION_TEXT_LENGTH * 0.5) splitAt = MAX_TRANSLATION_TEXT_LENGTH;
+    parts.push(remaining.slice(0, splitAt));
+    remaining = remaining.slice(splitAt);
+  }
+
+  if (remaining) parts.push(remaining);
+  return parts;
 }
 
 function findMirrorBlock(element, root) {
@@ -1166,7 +1339,9 @@ function replaceMirrorTextUnit(unit, translation) {
     mirrorState.textReplacements.set(node, { originalText, translatedText });
     node.nodeValue = translatedText;
   });
+  unit.element.classList?.remove("bit-pending", "bit-failed");
   unit.element.classList?.add("bit-mirror-translated-text");
+  addMirrorRetranslateButton(unit.element);
   return true;
 }
 
@@ -1296,7 +1471,11 @@ function createTranslatableBlock(element, currentSettings) {
   if (currentSettings.translateScope === "viewport" && !isElementInViewport(element)) return null;
 
   const text = getElementText(element);
-  if (!isUsefulText(text)) return null;
+  // Long paragraphs were dropped entirely here (isUsefulText caps text length), so a single
+  // >3000-char block — and its inline children, which get absorbed by hasTranslatableAncestor —
+  // never translated. Validate a prefix instead and let the provider truncate to its own limit.
+  const sample = text.length > MAX_TRANSLATION_TEXT_LENGTH ? text.slice(0, MAX_TRANSLATION_TEXT_LENGTH) : text;
+  if (!isUsefulText(sample)) return null;
   if (element.dataset.bitTranslatedText === text) return null;
   if (shouldSkipTranslatedText(text, currentSettings)) return null;
 
@@ -1328,7 +1507,11 @@ function groupDuplicateTextItems(items, { bucketName, getText, getKey = getText 
 }
 
 function getTranslationBatchSize(currentSettings) {
-  return clamp(Number(currentSettings.batchSize) || DEFAULT_SETTINGS.batchSize, 1, 20);
+  return normalizeTranslationBatchSize(currentSettings.batchSize);
+}
+
+function normalizeTranslationBatchSize(value) {
+  return clamp(Number(value) || DEFAULT_SETTINGS.batchSize, 1, MAX_TRANSLATION_BATCH_SIZE);
 }
 
 function ensureBlockId(element) {
@@ -1472,7 +1655,7 @@ function isTranslatableElement(element) {
   if (!isElementVisible(element)) return false;
 
   const text = getElementText(element);
-  if (text.length > 1600 && !isNaturallyTextBlock(element)) return false;
+  if (text.length > MAX_TRANSLATION_TEXT_LENGTH && !isNaturallyTextBlock(element)) return false;
 
   return true;
 }
@@ -1551,7 +1734,7 @@ function hasTranslatableAncestor(element) {
     const currentText = normalizeText(current.innerText || current.textContent || "");
     if (
       currentText.length >= 12 &&
-      currentText.length <= 1600 &&
+      currentText.length <= MAX_TRANSLATION_TEXT_LENGTH &&
       isNaturallyTextBlock(current) &&
       !isNestedListItem(element, current)
     ) {
@@ -1572,7 +1755,7 @@ function isNaturallyTextBlock(element) {
 }
 
 function isUsefulText(text) {
-  if (text.length < 2 || text.length > 1600) return false;
+  if (text.length < 2 || text.length > MAX_TRANSLATION_TEXT_LENGTH) return false;
   if (!/[A-Za-z0-9\uac00-\ud7af\u3040-\u30ff\u3400-\u9fff]/.test(text)) return false;
   if (/^[\d\s.,:;!?()[\]{}'"`~@#$%^&*+=|\\/<>-]+$/.test(text)) return false;
   return true;
@@ -1632,8 +1815,129 @@ function createTranslationNode(translation) {
   const translationNode = document.createElement("div");
   translationNode.className = "bit-translation";
   translationNode.dir = "auto";
-  translationNode.textContent = translation;
+
+  const textNode = document.createElement("span");
+  textNode.className = "bit-translation-text";
+  textNode.textContent = translation;
+  translationNode.appendChild(textNode);
+  translationNode.appendChild(createRetranslateButton());
+
   return translationNode;
+}
+
+function createRetranslateButton() {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "bit-retranslate";
+  button.title = "이 문단 다시 번역";
+  button.setAttribute("aria-label", "이 문단 다시 번역");
+  button.textContent = "↻";
+  return button;
+}
+
+// Re-translate a single block on demand (the ↻ shown on each translation). It re-requests
+// just that block as a one-item batch with the same engine — which also sidesteps the batch
+// JSON misalignment that makes weak LLMs echo/garble items, so a lone retry often succeeds
+// where the original batch didn't.
+function handleRetranslateClick(event) {
+  const button = event.target?.closest?.(".bit-retranslate");
+  if (!button) return;
+  event.preventDefault();
+  event.stopPropagation();
+
+  if (button.classList.contains("bit-retranslate-mirror")) {
+    if (button.parentElement) retranslateMirrorBlock(button.parentElement);
+    return;
+  }
+
+  const sourceId = button.closest(".bit-translation")?.dataset.bitSourceId;
+  const element = sourceId
+    ? document.querySelector(`[data-bit-block-id="${CSS.escape(sourceId)}"]`)
+    : null;
+  if (!element) return;
+
+  retranslateBlock(element).catch((error) => {
+    if (!isContextInvalidatedError(error)) console.warn("Re-translation failed", error);
+  });
+}
+
+async function retranslateBlock(element) {
+  if (!runtimeState.contextAlive || !element?.isConnected) return;
+
+  removeBlockTranslation(element);
+  const text = getElementText(element);
+  const sample = text.length > MAX_TRANSLATION_TEXT_LENGTH ? text.slice(0, MAX_TRANSLATION_TEXT_LENGTH) : text;
+  if (!isUsefulText(sample)) return;
+
+  const runId = runtimeState.activeRun;
+  markPending([{ element }]);
+
+  const { translatedCount } = await runTranslationBatches([{ key: text, text, blocks: [{ element }] }], {
+    runId,
+    batchSize: 1,
+    onBatchError: (batch, message) => markFailed(batch.flatMap((group) => group.blocks), message),
+    applyTranslation: (group, translation) => {
+      group.blocks.forEach((item) => renderTranslation(item.element, translation, runtimeState.settings.displayMode));
+      return group.blocks.length;
+    }
+  });
+
+  // Provider echoed again (translation dropped to null) — surface that rather than leaving a stuck spinner.
+  if (translatedCount === 0) markFailed([{ element }], "다시 번역했지만 번역 결과를 받지 못했습니다.");
+}
+
+function removeBlockTranslation(element) {
+  const sourceId = element.dataset.bitBlockId;
+  if (sourceId) {
+    document
+      .querySelectorAll(`.bit-translation[data-bit-source-id="${CSS.escape(sourceId)}"]`)
+      .forEach((node) => node.remove());
+  }
+  element.classList.remove("bit-pending", "bit-failed");
+  element.removeAttribute("data-bit-error");
+  delete element.dataset.bitTranslatedText;
+  if (element.classList.contains("bit-replaced")) {
+    if (element.dataset.bitOriginalText) element.textContent = element.dataset.bitOriginalText;
+    element.classList.remove("bit-replaced");
+    delete element.dataset.bitOriginalText;
+  }
+}
+
+function addMirrorRetranslateButton(block) {
+  if (!block || block.querySelector(":scope > .bit-retranslate")) return;
+  const button = createRetranslateButton();
+  button.classList.add("bit-retranslate-mirror");
+  block.appendChild(button);
+}
+
+// Split-view re-translate: the translation lives inside the cloned block's text nodes, so we
+// restore the block to its original text, forget its cached/failed translations, then let the
+// normal mirror pass pick it back up — now untranslated, and effectively a one-item request.
+function retranslateMirrorBlock(block) {
+  if (!mirrorState.active || !block?.isConnected) return;
+  restoreMirrorBlockToOriginal(block);
+  scheduleMirrorTranslation(MIRROR_TRANSLATION_DELAY_MS.immediate);
+}
+
+function restoreMirrorBlockToOriginal(block) {
+  block.querySelector(":scope > .bit-retranslate")?.remove();
+  block.classList.remove("bit-mirror-translated-text", "bit-pending", "bit-failed");
+
+  collectMirrorBlockTextNodes(block).forEach((node) => {
+    const replacement = mirrorState.textReplacements.get(node);
+    if (replacement) {
+      node.nodeValue = replacement.originalText;
+      mirrorState.textReplacements.delete(node);
+    }
+  });
+
+  // Drop cached/failed translations for every unit in the block so the next pass re-fetches
+  // instead of re-applying the same cached (bad) result.
+  createMirrorBlockTranslationUnits(block, collectMirrorBlockTextNodes(block)).forEach((unit) => {
+    const key = translationCacheKey(unit.text, runtimeState.settings);
+    mirrorState.translationCache.delete(key);
+    mirrorState.failedTranslationKeys.delete(key);
+  });
 }
 
 function preserveTextNodeSpacing(originalText, translation) {
@@ -1715,6 +2019,7 @@ function resetMirrorState() {
   mirrorState.lastViewportSignature = "";
   mirrorState.translationCache.clear();
   mirrorState.textReplacements.clear();
+  mirrorState.failedTranslationKeys.clear();
   mirrorState.originalOverflow = "";
   mirrorState.originalBodyOverflow = "";
 }
@@ -1760,6 +2065,12 @@ async function sendRuntimeMessage(message, { optional = false } = {}) {
       return null;
     }
 
+    // The MV3 service worker can be recycled mid-request, closing the channel before it
+    // answers ("message channel closed before a response was received"). That's transient:
+    // abort this pass quietly so the next viewport trigger retries, instead of throwing a
+    // scary error from auto-translation.
+    if (isRuntimeMessageClosedError(error)) return null;
+
     if (optional) return null;
     throw error;
   }
@@ -1769,7 +2080,7 @@ function safeSendResponse(sendResponse, payload) {
   try {
     sendResponse(payload);
   } catch (error) {
-    if (!isContextInvalidatedError(error)) throw error;
+    if (!isContextInvalidatedError(error) && !isRuntimeMessageClosedError(error)) throw error;
   }
 }
 
@@ -1794,9 +2105,14 @@ function isExtensionContextAlive() {
 
 function isContextInvalidatedError(error) {
   const text = error?.message || String(error || "");
+  return text.includes("Extension context invalidated") || text.includes("context invalidated");
+}
+
+function isRuntimeMessageClosedError(error) {
+  const text = error?.message || String(error || "");
   return (
-    text.includes("Extension context invalidated") ||
     text.includes("message channel closed") ||
+    text.includes("message port closed") ||
     text.includes("Receiving end does not exist")
   );
 }
