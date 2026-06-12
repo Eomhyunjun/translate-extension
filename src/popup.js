@@ -205,7 +205,13 @@ async function applyTranslation(viewMode) {
     options
   });
   requireOkResponse(response, "번역을 완료하지 못했습니다.");
-  setMessage(`${Number(response.translatedCount) || 0}개 문단을 번역했습니다.`);
+  const translatedCount = Number(response.translatedCount) || 0;
+  const failedCount = Number(response.failedCount) || 0;
+  setMessage(
+    failedCount > 0
+      ? `${translatedCount}개 문단을 번역했고 ${failedCount}개는 실패했습니다.`
+      : `${translatedCount}개 문단을 번역했습니다.`
+  );
 }
 
 async function clearCurrentTabTranslations() {

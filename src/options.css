@@ -162,6 +162,7 @@ kbd {
 
 input,
 select,
+textarea,
 button {
   min-height: 40px;
   border: 1px solid #cbd5e1;
@@ -170,7 +171,8 @@ button {
 }
 
 input,
-select {
+select,
+textarea {
   box-sizing: border-box;
   width: 100%;
   padding: 0 12px;
@@ -178,9 +180,20 @@ select {
   background: #ffffff;
 }
 
+textarea {
+  min-height: 180px;
+  padding: 10px 12px;
+  resize: vertical;
+  line-height: 1.5;
+}
+
 input[type="checkbox"] {
   width: 16px;
   min-height: 16px;
+}
+
+.raw-output-field {
+  margin-top: 18px;
 }
 
 .actions {
@@ -311,6 +324,7 @@ button {
 
   input,
   select,
+  textarea,
   button {
     border-color: #334155;
     color: #e5e7eb;

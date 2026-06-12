@@ -3,9 +3,11 @@ const SECRET_DEFAULTS = globalThis.BIT_SECRET_DEFAULTS;
 const SECRET_SETTING_KEYS = globalThis.BIT_SECRET_SETTING_KEYS;
 
 const settingsTab = document.querySelector("#settingsTab");
+const textTab = document.querySelector("#textTab");
 const keysTab = document.querySelector("#keysTab");
 const logsTab = document.querySelector("#logsTab");
 const settingsPanel = document.querySelector("#settingsPanel");
+const textPanel = document.querySelector("#textPanel");
 const keysPanel = document.querySelector("#keysPanel");
 const logsPanel = document.querySelector("#logsPanel");
 const message = document.querySelector("#message");
@@ -47,9 +49,14 @@ const logSummary = document.querySelector("#logSummary");
 const saveBtn = document.querySelector("#saveBtn");
 const resetBtn = document.querySelector("#resetBtn");
 const clearLogsBtn = document.querySelector("#clearLogsBtn");
+const rawTextInput = document.querySelector("#rawTextInput");
+const rawTextOutput = document.querySelector("#rawTextOutput");
+const rawTranslateBtn = document.querySelector("#rawTranslateBtn");
+const rawClearBtn = document.querySelector("#rawClearBtn");
 
 const TAB_CONTROLS = Object.freeze({
   settings: { tab: settingsTab, panel: settingsPanel },
+  text: { tab: textTab, panel: textPanel },
   keys: { tab: keysTab, panel: keysPanel },
   logs: { tab: logsTab, panel: logsPanel }
 });
@@ -72,10 +79,14 @@ const SETTINGS_MESSAGES = Object.freeze({
   invalidCompatibleEndpoint: "OpenAI-compatible endpoint는 HTTPS URL이어야 하며 /chat/completions로 끝나야 합니다.",
   compatibleEndpointDenied: "OpenAI-compatible endpoint 권한이 승인되지 않아 저장하지 않았습니다."
 });
+const MAX_TRANSLATION_BATCH_SIZE = 50;
+const MAX_RAW_TEXT_CHARS = 3000;
+const TRANSLATION_COUNT_MISMATCH_MESSAGE = "Translation response did not include the expected number of translations.";
 
 init().catch((error) => setMessage(error.message || SETTINGS_MESSAGES.initFailed));
 
 settingsTab.addEventListener("click", () => selectTab("settings"));
+textTab.addEventListener("click", () => selectTab("text"));
 keysTab.addEventListener("click", () => selectTab("keys"));
 logsTab.addEventListener("click", () => selectTab("logs"));
 saveSettingsBtn.addEventListener("click", () => runAction(savePublicSettings));
@@ -83,6 +94,8 @@ resetSettingsBtn.addEventListener("click", () => runAction(resetPublicSettings))
 saveBtn.addEventListener("click", () => runAction(saveKeys));
 resetBtn.addEventListener("click", () => runAction(resetKeys));
 clearLogsBtn.addEventListener("click", () => runAction(clearLogs));
+rawTranslateBtn.addEventListener("click", () => runAction(translateRawText));
+rawClearBtn.addEventListener("click", clearRawText);
 keepTextLogs.addEventListener("change", () => runAction(saveLogSetting));
 provider.addEventListener("change", syncProviderFields);
 viewMode.addEventListener("change", syncViewModeFields);
@@ -132,7 +145,7 @@ function fillPublicSettings(settings) {
   displayMode.value = settings.displayMode || DEFAULT_SETTINGS.displayMode;
   translateScope.value = settings.translateScope || DEFAULT_SETTINGS.translateScope;
   skipTranslated.checked = settings.skipTranslated !== false;
-  batchSize.value = clamp(Number(settings.batchSize) || DEFAULT_SETTINGS.batchSize, 1, 20);
+  batchSize.value = clamp(Number(settings.batchSize) || DEFAULT_SETTINGS.batchSize, 1, MAX_TRANSLATION_BATCH_SIZE);
   syncProviderFields();
   syncViewModeFields();
 }
@@ -160,7 +173,7 @@ function readPublicSettings() {
     displayMode: displayMode.value,
     translateScope: translateScope.value,
     skipTranslated: skipTranslated.checked,
-    batchSize: clamp(Number(batchSize.value) || DEFAULT_SETTINGS.batchSize, 1, 20)
+    batchSize: clamp(Number(batchSize.value) || DEFAULT_SETTINGS.batchSize, 1, MAX_TRANSLATION_BATCH_SIZE)
   };
 }
 
@@ -215,6 +228,111 @@ async function clearLogs() {
   await chrome.storage.local.set({ translationLogs: [] });
   await renderLogs();
   setMessage("사용 로그를 삭제했습니다.");
+}
+
+async function translateRawText() {
+  const rawText = rawTextInput.value.trim();
+  if (!rawText) {
+    setMessage("번역할 텍스트를 입력하세요.");
+    return;
+  }
+
+  rawTranslateBtn.disabled = true;
+  rawClearBtn.disabled = true;
+  rawTextOutput.value = "";
+  setMessage("텍스트 번역 중...");
+
+  try {
+    const settings = readPublicSettings();
+    await ensureEndpointPermission(settings);
+
+    const chunks = splitRawTextIntoChunks(rawText);
+    const batchSizeValue = clamp(Number(settings.batchSize) || DEFAULT_SETTINGS.batchSize, 1, MAX_TRANSLATION_BATCH_SIZE);
+    const translations = [];
+
+    for (let index = 0; index < chunks.length; index += batchSizeValue) {
+      const batch = chunks.slice(index, index + batchSizeValue);
+      translations.push(...await translateRawTextBatch(batch, settings));
+    }
+
+    rawTextOutput.value = translations.join("\n\n");
+    setMessage(`${translations.length}개 문단을 번역했습니다.`);
+  } finally {
+    rawTranslateBtn.disabled = false;
+    rawClearBtn.disabled = false;
+  }
+}
+
+function clearRawText() {
+  rawTextInput.value = "";
+  rawTextOutput.value = "";
+  setMessage("텍스트 번역 입력을 비웠습니다.");
+}
+
+async function translateRawTextBatch(texts, settings) {
+  const response = await chrome.runtime.sendMessage({
+    type: "TRANSLATE_BATCH",
+    texts,
+    options: {
+      ...settings,
+      viewMode: "inline",
+      displayMode: "replace",
+      translateScope: "page",
+      enabled: true
+    }
+  });
+
+  if (!response?.ok) {
+    const messageText = response?.error || "텍스트 번역에 실패했습니다.";
+    if (texts.length > 1 && isTranslationCountMismatchError(messageText)) {
+      return translateRawTextOneByOne(texts, settings);
+    }
+    throw new Error(messageText);
+  }
+
+  const translations = Array.isArray(response.translations) ? response.translations : [];
+  if (translations.length !== texts.length) {
+    if (texts.length > 1) return translateRawTextOneByOne(texts, settings);
+    throw new Error(TRANSLATION_COUNT_MISMATCH_MESSAGE);
+  }
+
+  return translations.map((translation) => String(translation || ""));
+}
+
+async function translateRawTextOneByOne(texts, settings) {
+  const translations = [];
+  for (const text of texts) {
+    const [translation] = await translateRawTextBatch([text], settings);
+    translations.push(translation);
+  }
+  return translations;
+}
+
+function splitRawTextIntoChunks(value) {
+  return value
+    .replace(/\r\n?/g, "\n")
+    .split(/\n{2,}/)
+    .flatMap(splitLongRawTextChunk)
+    .map((text) => text.trim())
+    .filter(Boolean);
+}
+
+function splitLongRawTextChunk(value) {
+  const text = value.trim();
+  if (text.length <= MAX_RAW_TEXT_CHARS) return [text];
+
+  const lines = text.split(/\n+/).map((line) => line.trim()).filter(Boolean);
+  if (lines.length > 1) return lines.flatMap(splitLongRawTextChunk);
+
+  const chunks = [];
+  for (let index = 0; index < text.length; index += MAX_RAW_TEXT_CHARS) {
+    chunks.push(text.slice(index, index + MAX_RAW_TEXT_CHARS));
+  }
+  return chunks;
+}
+
+function isTranslationCountMismatchError(value) {
+  return String(value || "").includes(TRANSLATION_COUNT_MISMATCH_MESSAGE);
 }
 
 async function renderLogs() {

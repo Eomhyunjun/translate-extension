@@ -15,6 +15,7 @@
 
       <nav class="tabs" aria-label="상세 설정 탭" role="tablist">
         <button id="settingsTab" class="tab active" type="button" role="tab" aria-controls="settingsPanel" aria-selected="true">번역 설정</button>
+        <button id="textTab" class="tab" type="button" role="tab" aria-controls="textPanel" aria-selected="false">텍스트 번역</button>
         <button id="keysTab" class="tab" type="button" role="tab" aria-controls="keysPanel" aria-selected="false">API 키</button>
         <button id="logsTab" class="tab" type="button" role="tab" aria-controls="logsPanel" aria-selected="false">사용 로그</button>
       </nav>
@@ -189,17 +190,41 @@
               aria-expanded="false"
             >!</button>
           </span>
-          <input id="batchSize" type="number" min="1" max="20" step="1" />
+          <input id="batchSize" type="number" min="1" max="50" step="1" />
         </label>
 
         <p id="batchHelp" class="help-popover" hidden>
-          페이지에서 찾은 문단을 API에 몇 개씩 묶어서 보낼지 정합니다. 숫자가 크면 빠를 수 있지만 실패 가능성이 올라가고, 작으면 느리지만 안정적입니다.
+          페이지에서 찾은 문단을 API에 몇 개씩 묶어서 보낼지 정합니다. 최대 50개까지 설정할 수 있고, 숫자가 크면 빠를 수 있지만 실패 가능성이 올라갑니다.
         </p>
 
         <div class="actions">
           <button id="saveSettingsBtn" class="primary" type="button">설정 저장</button>
           <button id="resetSettingsBtn" type="button">기본값으로</button>
         </div>
+      </section>
+
+      <section id="textPanel" role="tabpanel" aria-labelledby="textTab" hidden>
+        <div class="section-heading">
+          <div>
+            <h2>텍스트 번역</h2>
+            <p>현재 번역 엔진과 언어 설정으로 붙여넣은 텍스트를 바로 번역합니다.</p>
+          </div>
+        </div>
+
+        <label class="field">
+          <span>원문 텍스트</span>
+          <textarea id="rawTextInput" rows="10" placeholder="번역할 텍스트를 붙여넣으세요."></textarea>
+        </label>
+
+        <div class="actions">
+          <button id="rawTranslateBtn" class="primary" type="button">번역</button>
+          <button id="rawClearBtn" type="button">비우기</button>
+        </div>
+
+        <label class="field raw-output-field">
+          <span>번역 결과</span>
+          <textarea id="rawTextOutput" rows="10" readonly placeholder="번역 결과가 여기에 표시됩니다."></textarea>
+        </label>
       </section>
 
       <section id="keysPanel" role="tabpanel" aria-labelledby="keysTab" hidden>
