@@ -76,12 +76,21 @@ const PROVIDER_MODEL_LABELS = {
   mymemory: "MyMemory"
 };
 
-const TRANSLATION_JSON_ARRAY_INSTRUCTION =
-  "Translate each input string faithfully. Preserve meaning, names, numbers, punctuation, and inline whitespace. Return only a JSON array of translated strings with the same length and order as the input. Do not merge, split, omit, or add items.";
-const TRANSLATION_JSON_OBJECT_INSTRUCTION =
-  "Translate each input string faithfully. Preserve meaning, names, numbers, punctuation, and inline whitespace. Return only JSON with this shape: {\"translations\":[\"...\"]}. The translations array must have the same length and order as the input texts. Do not merge, split, omit, or add items.";
-const CLAUDE_SYSTEM_INSTRUCTION =
-  "Translate faithfully. Preserve meaning, names, numbers, punctuation, and inline whitespace. Return only a JSON array of translated strings. Do not merge, split, omit, or add items.";
+const TRANSLATION_UNIT_INSTRUCTION =
+  "Translate each input string as one complete unit, faithfully and naturally.";
+const TRANSLATION_PRESERVE_INSTRUCTION =
+  "Preserve meaning, names, numbers, punctuation, inline whitespace, URLs, and email addresses.";
+const TRANSLATION_ARRAY_ITEM_INSTRUCTION =
+  "Do not merge, split, omit, reorder, or add array items.";
+const TRANSLATION_JSON_ARRAY_INSTRUCTION = buildTranslationInstruction(
+  "Return only a JSON array of translated strings with the same length and order as the input."
+);
+const TRANSLATION_JSON_OBJECT_INSTRUCTION = buildTranslationInstruction(
+  "Return only JSON with this shape: {\"translations\":[\"...\"]}. The translations array must have the same length and order as the input texts."
+);
+const CLAUDE_SYSTEM_INSTRUCTION = buildTranslationInstruction(
+  "Return only a JSON array of translated strings."
+);
 const TRANSLATION_ARRAY_RESPONSE_KEYS = Object.freeze([
   "translations",
   "translatedTexts",
@@ -980,10 +989,20 @@ function createTranslationParseError(content, usage = null) {
   return error;
 }
 
+function buildTranslationInstruction(outputInstruction) {
+  return [
+    TRANSLATION_UNIT_INSTRUCTION,
+    TRANSLATION_PRESERVE_INSTRUCTION,
+    outputInstruction,
+    TRANSLATION_ARRAY_ITEM_INSTRUCTION
+  ].join(" ");
+}
+
 function buildTranslationPrompt(targetLang, sourceLang, texts) {
   return JSON.stringify({
-    instruction:
-      "Translate each input string faithfully. Preserve meaning, names, numbers, punctuation, and inline whitespace. Return only a JSON array of translated strings. Return exactly one translated string for each input string. Do not merge, split, omit, or add items.",
+    instruction: buildTranslationInstruction(
+      "Return only a JSON array of translated strings. Return exactly one translated string for each input string."
+    ),
     target_language: targetLang,
     source_language: sourceLang,
     expected_count: texts.length,

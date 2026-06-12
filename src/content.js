@@ -58,6 +58,12 @@ const TEXT_CONTAINER_SELECTOR = [
   "[role='button']"
 ].join(",");
 
+const INLINE_SENTENCE_TAGS = new Set([
+  "A", "SPAN", "STRONG", "EM", "B", "I", "SMALL", "TIME", "MARK", "SUP", "SUB",
+  "CODE", "KBD", "ABBR", "CITE", "Q", "U", "S", "WBR", "BDI", "BDO", "DFN", "VAR",
+  "SAMP", "INS", "DEL", "LABEL", "FONT", "BR"
+]);
+
 const EXCLUDED_SELECTOR = [
   ".bit-translation",
   ".bit-retranslate",
@@ -338,22 +344,20 @@ async function runTranslationBatch(batch, {
 
   if (!response.ok) {
     const message = response?.error || errorMessage;
-    if (isTranslationCountMismatchError(message)) {
-      if (batch.length > 1) {
-        return runSingleTranslationFallback(batch, {
-          runId,
-          shouldContinue,
-          onBatchError,
-          errorMessage,
-          applyTranslation
-        });
-      }
-
-      onBatchError?.(batch, message);
-      return { translatedCount: 0, failedCount: batch.length, aborted: false };
+    if (batch.length > 1 && shouldTrySingleTranslationFallback(message)) {
+      return runSingleTranslationFallback(batch, {
+        runId,
+        shouldContinue,
+        onBatchError,
+        errorMessage,
+        applyTranslation
+      });
     }
 
     onBatchError?.(batch, message);
+    if (isTranslationCountMismatchError(message)) {
+      return { translatedCount: 0, failedCount: batch.length, aborted: false };
+    }
     if (isFatalTranslationError(message)) throw new Error(message);
     return { translatedCount: 0, failedCount: batch.length, aborted: shouldStopAfterBatchError(message) };
   }
@@ -435,6 +439,12 @@ function isTranslationCountMismatchError(message) {
   return String(message || "").includes(TRANSLATION_COUNT_MISMATCH_MESSAGE);
 }
 
+function shouldTrySingleTranslationFallback(message) {
+  if (isTranslationCountMismatchError(message)) return true;
+  const text = String(message || "").toLowerCase();
+  return text.includes("request failed: 400");
+}
+
 function isFatalTranslationError(message) {
   const text = String(message || "").toLowerCase();
   return (
@@ -484,7 +494,7 @@ async function translatePage(overrides = {}) {
   const { translatedCount, failedCount } = await runTranslationBatches(groups, {
     runId,
     onBatchStart: (batch) => markPending(batch.flatMap((group) => group.blocks)),
-    onBatchError: (batch, message) => markFailed(batch.flatMap((group) => group.blocks), message),
+    onBatchError: (batch, message) => markTranslationBatchError(batch, message, { quiet: Boolean(overrides.auto) }),
     applyTranslation: (group, translation) => {
       group.blocks.forEach((item) => renderTranslation(item.element, translation, runtimeState.settings.displayMode));
       return group.blocks.length;
@@ -1012,7 +1022,14 @@ function markMirrorTranslationFailed(groups, message) {
   const retryable = shouldStopAfterBatchError(message);
   groups.forEach((group) => {
     if (group?.key && !retryable) mirrorState.failedTranslationKeys.add(group.key);
-    group?.units?.forEach((unit) => unit.element.classList?.add("bit-failed"));
+    group?.units?.forEach((unit) => {
+      unit.element.classList?.remove("bit-pending");
+      if (!retryable) {
+        unit.element.classList?.add("bit-failed");
+        unit.element.dataset.bitError = message;
+        addMirrorRetranslateButton(unit.element);
+      }
+    });
   });
 }
 
@@ -1055,7 +1072,7 @@ function collectMirrorTextUnits(root, currentSettings) {
 
 function createMirrorBlockTranslationUnits(element, textNodes) {
   const text = normalizeText(textNodes.map((node) => node.nodeValue || "").join(""));
-  if (isUsefulText(text)) return [{ element, textNodes, text }];
+  if (isTranslatableText(text)) return [{ element, textNodes, text }];
   if (text.length <= MAX_TRANSLATION_TEXT_LENGTH) return [];
 
   return splitMirrorTextNodesIntoUnits(element, expandLongMirrorTextNodes(textNodes));
@@ -1068,7 +1085,7 @@ function splitMirrorTextNodesIntoUnits(element, textNodes) {
 
   const flush = () => {
     const text = normalizeText(currentParts.join(""));
-    if (isUsefulText(text)) units.push({ element, textNodes: currentNodes, text });
+    if (isTranslatableText(text)) units.push({ element, textNodes: currentNodes, text });
     currentNodes = [];
     currentParts = [];
   };
@@ -1201,7 +1218,7 @@ function isTranslatableMirrorTextNode(node, currentSettings) {
   if (mirrorState.textReplacements.has(node)) return false;
 
   const text = normalizeText(node.nodeValue || "");
-  if (!isUsefulText(text)) return false;
+  if (!isTranslatableText(text)) return false;
   if (shouldSkipTranslatedText(text, currentSettings)) return false;
   if (!isValidMirrorTextParent(node.parentElement)) return false;
 
@@ -1210,7 +1227,7 @@ function isTranslatableMirrorTextNode(node, currentSettings) {
 
 function isMirrorAnchorTextNode(node) {
   const text = getMirrorOriginalTextNodeText(node);
-  if (!isUsefulText(text)) return false;
+  if (!isTranslatableText(text)) return false;
   return isValidMirrorTextParent(node.parentElement);
 }
 
@@ -1340,6 +1357,7 @@ function replaceMirrorTextUnit(unit, translation) {
     node.nodeValue = translatedText;
   });
   unit.element.classList?.remove("bit-pending", "bit-failed");
+  unit.element.removeAttribute?.("data-bit-error");
   unit.element.classList?.add("bit-mirror-translated-text");
   addMirrorRetranslateButton(unit.element);
   return true;
@@ -1408,8 +1426,8 @@ async function translateVisibleIfEnabled() {
   runtimeState.isAutoTranslating = true;
   let translatedOk = false;
   try {
-    await translatePage({ ...runtimeState.settings, translateScope: "viewport", enabled: true, auto: true });
-    translatedOk = true;
+    const result = await translatePage({ ...runtimeState.settings, translateScope: "viewport", enabled: true, auto: true });
+    translatedOk = !result?.failedCount;
   } catch (error) {
     if (!isContextInvalidatedError(error)) {
       console.warn("Auto translation failed", error);
@@ -1471,11 +1489,7 @@ function createTranslatableBlock(element, currentSettings) {
   if (currentSettings.translateScope === "viewport" && !isElementInViewport(element)) return null;
 
   const text = getElementText(element);
-  // Long paragraphs were dropped entirely here (isUsefulText caps text length), so a single
-  // >3000-char block — and its inline children, which get absorbed by hasTranslatableAncestor —
-  // never translated. Validate a prefix instead and let the provider truncate to its own limit.
-  const sample = text.length > MAX_TRANSLATION_TEXT_LENGTH ? text.slice(0, MAX_TRANSLATION_TEXT_LENGTH) : text;
-  if (!isUsefulText(sample)) return null;
+  if (!isTranslatableBlockText(text)) return null;
   if (element.dataset.bitTranslatedText === text) return null;
   if (shouldSkipTranslatedText(text, currentSettings)) return null;
 
@@ -1533,6 +1547,7 @@ function collectTextNodeContainers() {
     acceptNode(node) {
       const text = normalizeText(node.nodeValue || "");
       if (text.length < 2) return NodeFilter.FILTER_REJECT;
+      if (isStandaloneUrlLikeText(text)) return NodeFilter.FILTER_REJECT;
       const parent = node.parentElement;
       if (!parent || parent.closest(EXCLUDED_SELECTOR)) return NodeFilter.FILTER_REJECT;
       if (!isElementVisible(parent)) return NodeFilter.FILTER_REJECT;
@@ -1597,6 +1612,9 @@ function shouldSkipTranslatedText(text, currentSettings) {
 function getTextContainer(element) {
   const semanticContainer = element.closest(TEXT_CONTAINER_SELECTOR);
   if (semanticContainer) return semanticContainer;
+
+  const inlineSentenceContainer = findInlineSentenceContainer(element);
+  if (inlineSentenceContainer) return inlineSentenceContainer;
 
   let current = element;
   while (current && current !== document.body) {
@@ -1728,7 +1746,11 @@ function hasTranslatableAncestor(element) {
     if (current.matches?.(TEXT_CONTAINER_SELECTOR) && !isNestedListItem(element, current)) return true;
     // Inline link/emphasis embedded in a non-semantic sentence block → absorb into that
     // block so the sentence stays one unit instead of fragmenting into words.
-    if (inlineCandidate && hasOwnSentenceText(current) && !isNestedListItem(element, current)) {
+    if (
+      inlineCandidate &&
+      (hasOwnSentenceText(current) || isInlineSentenceContainer(current)) &&
+      !isNestedListItem(element, current)
+    ) {
       return true;
     }
     const currentText = normalizeText(current.innerText || current.textContent || "");
@@ -1761,6 +1783,70 @@ function isUsefulText(text) {
   return true;
 }
 
+function isTranslatableText(text) {
+  return isUsefulText(text) && !isStandaloneUrlLikeText(text);
+}
+
+function isTranslatableBlockText(text) {
+  // Validate a prefix for very long blocks; otherwise a single >3000-char paragraph would
+  // be dropped before provider-side limits get a chance to handle it.
+  return isUsefulText(getTranslationTextSample(text)) && !isStandaloneUrlLikeText(text);
+}
+
+function getTranslationTextSample(text) {
+  return text.length > MAX_TRANSLATION_TEXT_LENGTH ? text.slice(0, MAX_TRANSLATION_TEXT_LENGTH) : text;
+}
+
+function findInlineSentenceContainer(element) {
+  let current = element?.parentElement;
+  while (current && current !== document.body) {
+    if (current.closest(EXCLUDED_SELECTOR)) return null;
+    if (isInlineSentenceContainer(current)) return current;
+    current = current.parentElement;
+  }
+  return null;
+}
+
+function isInlineSentenceContainer(element) {
+  if (!BLOCK_SENTENCE_TAGS.includes(element.tagName)) return false;
+  if (!hasOnlyInlineSentenceChildren(element)) return false;
+
+  const text = normalizeText(element.innerText || element.textContent || "");
+  if (text.length < 8 || text.length > MAX_TRANSLATION_TEXT_LENGTH) return false;
+  return isTranslatableText(text);
+}
+
+function hasOnlyInlineSentenceChildren(element) {
+  const children = Array.from(element.children).filter((child) => !child.matches(EXCLUDED_SELECTOR));
+  return children.length > 0 && children.every(isInlineSentenceChild);
+}
+
+function isInlineSentenceChild(element) {
+  if (!INLINE_SENTENCE_TAGS.has(element.tagName) && element.getAttribute("role") !== "link") return false;
+  return Array.from(element.children).every(isInlineSentenceChild);
+}
+
+function isStandaloneUrlLikeText(text) {
+  const tokens = String(text || "")
+    .split(/\s+/)
+    .map(stripUrlTokenPunctuation)
+    .filter(Boolean);
+
+  return tokens.length > 0 && tokens.every(isUrlLikeToken);
+}
+
+function stripUrlTokenPunctuation(token) {
+  return token.replace(/^[<([{"'`]+|[>)\]},"'`.;!?]+$/g, "");
+}
+
+function isUrlLikeToken(token) {
+  if (/^(?:https?|ftp):\/\/[^\s]+$/i.test(token)) return true;
+  if (/^mailto:[^\s@]+@[^\s@]+\.[^\s@]+$/i.test(token)) return true;
+  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/i.test(token)) return true;
+  if (/^www\.[^\s]+\.[^\s]+$/i.test(token)) return true;
+  return /^(?:[a-z0-9-]+\.)+[a-z]{2,}(?::\d{2,5})?(?:\/[^\s]*)?$/i.test(token);
+}
+
 function getElementText(element) {
   if (element.matches("li, td, th")) {
     const clone = element.cloneNode(true);
@@ -1776,6 +1862,7 @@ function renderTranslation(element, translation, displayMode) {
   element.removeAttribute("data-bit-error");
   element.dataset.bitTranslatedText = getElementText(element);
   const sourceId = ensureBlockId(element);
+  removeTranslationNodesForSourceId(sourceId);
 
   if (displayMode === "replace") {
     if (element.classList.contains("bit-replaced")) return;
@@ -1787,10 +1874,16 @@ function renderTranslation(element, translation, displayMode) {
 
   const translationNode = createTranslationNode(translation);
   translationNode.dataset.bitSourceId = sourceId;
+  insertTranslationNode(element, translationNode);
+}
+
+function removeTranslationNodesForSourceId(sourceId) {
   document
     .querySelectorAll(`.bit-translation[data-bit-source-id="${CSS.escape(sourceId)}"]`)
     .forEach((node) => node.remove());
+}
 
+function insertTranslationNode(element, translationNode) {
   if (element.matches("td, th")) {
     element.appendChild(translationNode);
     return;
@@ -1811,6 +1904,15 @@ function renderTranslation(element, translation, displayMode) {
   element.insertAdjacentElement("afterend", translationNode);
 }
 
+function renderFailure(element, message) {
+  const sourceId = ensureBlockId(element);
+  removeTranslationNodesForSourceId(sourceId);
+
+  const failureNode = createFailureNode(message);
+  failureNode.dataset.bitSourceId = sourceId;
+  insertTranslationNode(element, failureNode);
+}
+
 function createTranslationNode(translation) {
   const translationNode = document.createElement("div");
   translationNode.className = "bit-translation";
@@ -1825,13 +1927,28 @@ function createTranslationNode(translation) {
   return translationNode;
 }
 
-function createRetranslateButton() {
+function createFailureNode(message) {
+  const failureNode = document.createElement("div");
+  failureNode.className = "bit-translation bit-translation-failed";
+  failureNode.dir = "auto";
+  if (message) failureNode.title = message;
+
+  const textNode = document.createElement("span");
+  textNode.className = "bit-translation-text";
+  textNode.textContent = "번역 실패";
+  failureNode.appendChild(textNode);
+  failureNode.appendChild(createRetranslateButton("다시 시도"));
+
+  return failureNode;
+}
+
+function createRetranslateButton(label = "↻") {
   const button = document.createElement("button");
   button.type = "button";
   button.className = "bit-retranslate";
   button.title = "이 문단 다시 번역";
   button.setAttribute("aria-label", "이 문단 다시 번역");
-  button.textContent = "↻";
+  button.textContent = label;
   return button;
 }
 
@@ -1866,8 +1983,7 @@ async function retranslateBlock(element) {
 
   removeBlockTranslation(element);
   const text = getElementText(element);
-  const sample = text.length > MAX_TRANSLATION_TEXT_LENGTH ? text.slice(0, MAX_TRANSLATION_TEXT_LENGTH) : text;
-  if (!isUsefulText(sample)) return;
+  if (!isTranslatableBlockText(text)) return;
 
   const runId = runtimeState.activeRun;
   markPending([{ element }]);
@@ -1922,6 +2038,7 @@ function retranslateMirrorBlock(block) {
 function restoreMirrorBlockToOriginal(block) {
   block.querySelector(":scope > .bit-retranslate")?.remove();
   block.classList.remove("bit-mirror-translated-text", "bit-pending", "bit-failed");
+  block.removeAttribute("data-bit-error");
 
   collectMirrorBlockTextNodes(block).forEach((node) => {
     const replacement = mirrorState.textReplacements.get(node);
@@ -1951,7 +2068,25 @@ function markPending(batch) {
     element.classList.add("bit-pending");
     element.classList.remove("bit-failed");
     element.removeAttribute("data-bit-error");
+    const sourceId = element.dataset.bitBlockId;
+    if (sourceId) removeTranslationNodesForSourceId(sourceId);
   });
+}
+
+function clearPending(batch) {
+  batch.forEach(({ element }) => {
+    element.classList.remove("bit-pending");
+  });
+}
+
+function markTranslationBatchError(batch, message, { quiet = false } = {}) {
+  const blocks = batch.flatMap((group) => group.blocks);
+  if (quiet || shouldStopAfterBatchError(message)) {
+    clearPending(blocks);
+    return;
+  }
+
+  markFailed(blocks, message);
 }
 
 function markFailed(batch, message) {
@@ -1959,6 +2094,7 @@ function markFailed(batch, message) {
     element.classList.remove("bit-pending");
     element.classList.add("bit-failed");
     element.dataset.bitError = message;
+    renderFailure(element, message);
   });
 }
 

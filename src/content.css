@@ -11,6 +11,15 @@
   white-space: pre-wrap;
 }
 
+.bit-translation-failed {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-left-color: #dc2626;
+  background: color-mix(in srgb, #dc2626 8%, transparent);
+  color: #991b1b;
+}
+
 .bit-retranslate {
   position: absolute;
   top: 4px;
@@ -42,6 +51,25 @@
   background: color-mix(in srgb, #2563eb 24%, #fff);
 }
 
+.bit-translation-failed .bit-retranslate {
+  position: static;
+  width: auto;
+  height: auto;
+  min-height: 24px;
+  margin-left: auto;
+  padding: 0 8px;
+  border-color: color-mix(in srgb, #dc2626 35%, transparent);
+  background: color-mix(in srgb, #dc2626 10%, #fff);
+  color: #991b1b;
+  font-size: 0.86em;
+  white-space: nowrap;
+  opacity: 1;
+}
+
+.bit-translation-failed .bit-retranslate:hover {
+  background: color-mix(in srgb, #dc2626 18%, #fff);
+}
+
 .bit-pending {
   outline: 1px dashed rgba(37, 99, 235, 0.45);
   outline-offset: 2px;
@@ -52,12 +80,17 @@
   outline-offset: 2px;
 }
 
-.bit-failed::after {
+.bit-mirror-pane .bit-failed::after {
   content: "번역 실패";
-  display: block;
+  display: none;
   margin-top: 0.25em;
   color: #b91c1c;
   font-size: 0.86em;
+}
+
+.bit-mirror-pane .bit-failed:hover::after,
+.bit-mirror-pane .bit-failed:focus-within::after {
+  display: block;
 }
 
 .bit-replaced {
@@ -161,6 +194,7 @@
 }
 
 .bit-mirror-translated-text:hover > .bit-retranslate-mirror,
+.bit-failed:hover > .bit-retranslate-mirror,
 .bit-retranslate-mirror:focus-visible {
   opacity: 1;
 }
