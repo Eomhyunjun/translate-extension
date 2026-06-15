@@ -1,67 +1,117 @@
 # Bilingual Immersive Translator
 
-Immersive Translate style browser extension prototype. It translates readable page blocks inline, and can also open an in-page split view that mirrors the current HTML and replaces visible text on the translated side.
+A Manifest V3 Chrome/Edge extension for translating web pages in place. It can render translated text under each original paragraph, replace the original text, or open a same-tab split view with the original page on the left and translated text on the right.
+
+The extension is intentionally simple: vanilla JavaScript, no build step, no bundler, and no runtime dependencies.
 
 ## Features
 
-- Chrome/Edge Manifest V3 extension
-- Paragraph-level bilingual translation
-- Split translation mode: mirrors the current page inside the same tab with a 1:1 grid
-- Scroll synchronization between the original and translated panes
-- Extension icon click opens a compact popup for provider/model/language selection
-- Right-click extension settings for provider, model, language, display mode, skip behavior, and paragraph batch size
-- Popup buttons start inline translation or same-tab split translation immediately
-- Popup translation removal clears translated text and closes split view
-- Google Translate provider by default
-- Microsoft Translator, Zhipu BigModel, GPT/OpenAI, Gemini, Claude, Upstage Solar, MyMemory, and OpenAI-compatible providers
-- API keys stored in `chrome.storage.local`, not synced across browser profiles
-- Optional usage logs stored locally, disabled by default
+- Inline bilingual translation for readable page blocks
+- Same-tab split translation view with scroll sync
+- Popup controls for provider, model, source language, and target language
+- Options page for full settings, API keys, usage logs, and pasted-text translation
+- Per-paragraph retry when a translation fails
+- Batch fallback for model responses that return malformed or mismatched output
+- URL, domain, and email-like standalone text skipping
+- Inline sentence grouping for text split across sibling tags
+- Local-only API key storage via `chrome.storage.local`
+- Optional local usage logs with request previews and token estimates
 
-## Install locally
+## Supported Providers
+
+- Google Translate web endpoint, no key required
+- MyMemory, no key required
+- Microsoft Translator
+- Zhipu BigModel
+- GPT / OpenAI
+- Gemini
+- Claude
+- Upstage Solar
+- Generic OpenAI-compatible chat completions endpoint
+
+Keyed providers require their own API keys. The extension never sends API keys to content scripts; provider calls are made from the background service worker.
+
+## Install Locally
 
 1. Open `chrome://extensions` or `edge://extensions`.
-2. Enable developer mode.
-3. Click "Load unpacked".
-4. Select this project directory.
-5. Open any article page and click the extension icon to translate. Click again to remove translations.
-6. Right-click the extension icon and choose settings to configure providers, models, API keys, and logs.
+2. Enable Developer mode.
+3. Click `Load unpacked`.
+4. Select this repository directory.
+5. Pin or open the extension from the browser toolbar.
+6. Configure provider settings from the popup or the options page.
 
-## Provider setup
+When editing the extension:
 
-The default Google provider uses a public web endpoint and requires no key, but it is best treated as a prototype/testing path. It defaults to English source text; change the source language in the settings page when translating other languages.
+- Reload the extension after changing `src/background.js`, `manifest.json`, or HTML files.
+- Reload the target web page after changing `src/content.js` or `src/content.css`.
+- Reopen the popup/options page after changing popup/options files.
 
-Microsoft Translator, Zhipu BigModel, GPT/OpenAI, Gemini, Claude, and Upstage Solar may have free quotas or free-tier credits depending on the provider, but they still require provider accounts and API keys.
+## Usage
 
-- Microsoft: choose `Microsoft Translator`, then set your Azure Translator key and region.
-- Zhipu: choose `Zhipu BigModel`, then set your Zhipu API key and model, such as `glm-4-flash`.
-- GPT/OpenAI: choose `GPT / OpenAI`, then set your OpenAI API key and model.
-- Gemini: choose `Gemini`, then set your Google AI Studio API key and model.
-- Claude: choose `Claude`, then set your Anthropic API key and model.
-- Upstage Solar: choose `Upstage Solar`, then set your Upstage API key and model, such as `solar-pro3`. The OpenAI-compatible endpoint is fixed to `https://api.upstage.ai/v1/solar/chat/completions`.
-- MyMemory: choose `MyMemory 무료 API`; no key is required, but public limits are low.
-- OpenAI-compatible: choose `OpenAI-compatible`, then set the provider API key, model, and an HTTPS endpoint ending in `/chat/completions`.
+Open the popup and choose one of the translation modes:
 
-## API key privacy
+- `Inline view`: translates visible/page blocks in place.
+- `Split view`: opens a two-pane reader inside the current tab.
+- `Clear translations`: removes injected translation UI and closes split view.
 
-User API keys are stored only in `chrome.storage.local`. They are not stored in `chrome.storage.sync`, are not sent to content scripts, and are used only by the background service worker when calling the selected translation provider.
+Keyboard shortcuts are defined in `manifest.json`:
 
-Browser extensions cannot make user-provided API keys impossible to inspect on the user's own device. For distribution, tell users to create revocable, quota-limited keys for this extension.
+- Inline translation: `Cmd+Shift+1` on macOS, `Alt+Shift+1` elsewhere
+- Split translation: `Cmd+Shift+2` on macOS, `Alt+Shift+2` elsewhere
 
-For better quality, choose a provider and model from the extension settings page. Add API keys from the same page.
+The options page also includes a pasted-text translation tab. It uses the same provider and language settings as page translation.
 
-## OpenAI-compatible endpoints
+## Provider Setup
 
-Any provider that supports OpenAI-compatible chat completions should work if it returns normal `choices[0].message.content`. The endpoint must be an HTTPS URL without embedded credentials, and the path must end with `/chat/completions`. Non-OpenAI hosts request optional host permission when you save them.
+The default Google provider requires no key and is useful for quick local testing. For better quality and reliability, choose a keyed provider in the options page.
 
-Defaults:
+- Microsoft: set your Azure Translator key and region.
+- Zhipu: set your Zhipu API key and model.
+- GPT / OpenAI: set your OpenAI API key and model.
+- Gemini: set your Google AI Studio API key and model.
+- Claude: set your Anthropic API key and model.
+- Upstage Solar: set your Upstage API key and model.
+- OpenAI-compatible: set a provider API key, model, and HTTPS endpoint ending in `/chat/completions`.
 
-- Endpoint: `https://api.openai.com/v1/chat/completions`
-- Model: `gpt-4o-mini`
+OpenAI-compatible endpoints cannot include embedded credentials. Non-OpenAI hosts request optional host permission when saved.
 
-## Usage logs
+## Privacy
 
-Usage logging is off by default. When enabled in the options page, the extension stores up to 100 request batches in `chrome.storage.local`, including input/output text previews, status, duration, and actual or estimated token counts.
+API keys are stored only in `chrome.storage.local`. They are not synced through `chrome.storage.sync` and are not exposed to page content scripts.
 
-## Notes
+Usage logging is disabled by default. When enabled, the extension stores up to 100 local request batch logs in `chrome.storage.local`, including input/output previews, status, duration, and token counts or estimates.
 
-This is a local prototype, not a store-ready clone. Production work should add caching, quota handling, streaming progress UI, PDF/EPUB support, subtitle support, and a privacy review before distribution.
+Browser extensions cannot make user-provided API keys impossible to inspect on the user's own device. Use revocable, quota-limited keys for this extension.
+
+## Project Structure
+
+```text
+manifest.json        Extension manifest
+popup.html           Browser action popup
+options.html         Full settings page
+src/defaults.js      Shared default settings schema
+src/background.js    Provider gateway and service worker
+src/content.js       Page DOM collection, rendering, split view, retry handling
+src/content.css      Injected page styles
+src/popup.js         Popup controller
+src/options.js       Options page controller
+assets/              Extension icons and logo
+```
+
+## Development
+
+There is no build command. The repository root is the unpacked extension.
+
+Useful checks:
+
+```bash
+node --check src/background.js
+node --check src/content.js
+node --check src/options.js
+node --check src/popup.js
+git diff --check
+```
+
+## Status
+
+This is a local extension prototype, not a Chrome Web Store-ready package. Before distribution, review provider quotas, content security policy, privacy copy, error handling, and browser-store requirements.
