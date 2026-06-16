@@ -118,6 +118,7 @@ const runtimeState = {
   nextBlockId: 1,
   contextAlive: true,
   lastViewportSignature: "",
+  contentObserver: null,
   cleanupHandlers: []
 };
 const mirrorState = {
@@ -172,7 +173,9 @@ function initializeContentScript() {
     if (area !== "sync" || !runtimeState.contextAlive) return;
     for (const [key, change] of Object.entries(changes)) {
       if (key === "enabled") continue;
-      runtimeState.settings[key] = change.newValue;
+      // A removed key reports no `newValue`; fall back to the default instead of
+      // writing `undefined` into the live settings (which then leaks into requests).
+      runtimeState.settings[key] = change.newValue !== undefined ? change.newValue : DEFAULT_SETTINGS[key];
     }
   });
 
@@ -655,6 +658,13 @@ function sanitizeMirrorCloneNode(cloneNode, sourceNode, cloneContext) {
 function sanitizeMirrorCloneElement(element, sourceElement, cloneContext) {
   element.classList.remove(...MIRROR_TRANSIENT_CLASSES);
   MIRROR_TRANSIENT_ATTRIBUTES.forEach((attribute) => element.removeAttribute(attribute));
+
+  // The original body stays in the (hidden) document while two clones are mounted, so every
+  // `id` would otherwise exist three times — invalid HTML that breaks getElementById, in-page
+  // `#fragment` anchors, `:target`, and label/aria id references. Drop ids from the display-only
+  // clones (scroll-sync uses data-bit-mirror-node-id instead). The only cost is page CSS written
+  // against `#id` selectors not styling the mirrored copy.
+  element.removeAttribute("id");
 
   Array.from(element.attributes).forEach((attribute) => {
     const name = attribute.name.toLowerCase();
@@ -1401,12 +1411,46 @@ function syncAutoMode() {
 
 function startAutoMode() {
   scheduleAutoTranslate();
+  startContentObserver();
 }
 
 function stopAutoMode() {
   window.clearTimeout(runtimeState.autoTranslateTimer);
   runtimeState.autoTranslateTimer = null;
   runtimeState.autoTranslatePending = false;
+  stopContentObserver();
+}
+
+// Lazy-loaded / async-injected content can enter the viewport without ever
+// firing a scroll or resize event, leaving it untranslated. Watch the DOM for
+// page-content changes and re-run the viewport pass when they happen.
+function startContentObserver() {
+  if (runtimeState.contentObserver || typeof MutationObserver !== "function" || !document.body) return;
+  const observer = new MutationObserver((mutations) => {
+    if (!runtimeState.contextAlive || mirrorState.active) return;
+    if (mutations.some(isPageContentMutation)) handlePossibleViewportChange();
+  });
+  observer.observe(document.body, { childList: true, subtree: true });
+  runtimeState.contentObserver = observer;
+}
+
+function stopContentObserver() {
+  runtimeState.contentObserver?.disconnect();
+  runtimeState.contentObserver = null;
+}
+
+// Ignore the mutations we cause ourselves (inserting/removing translation
+// nodes, swapping replaced text) so the observer doesn't retrigger in a loop.
+function isPageContentMutation(mutation) {
+  if (isOwnTranslationNode(mutation.target)) return false;
+  const changed = [...mutation.addedNodes, ...mutation.removedNodes];
+  if (changed.length === 0) return false;
+  return changed.some((node) => !isOwnTranslationNode(node));
+}
+
+function isOwnTranslationNode(node) {
+  const element = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
+  return Boolean(element?.closest?.(".bit-translation, .bit-retranslate, .bit-replaced, .bit-mirror-root"));
 }
 
 async function translateVisibleIfEnabled() {
@@ -1475,7 +1519,59 @@ function collectBlocks(currentSettings) {
     if (block) blocks.push(block);
   }
 
+  if (bitDebugEnabled()) logCollectDiagnostics(currentSettings, blocks.length);
   return blocks;
+}
+
+function bitDebugEnabled() {
+  try {
+    return Boolean(window.localStorage?.getItem("bitDebug"));
+  } catch {
+    return false;
+  }
+}
+
+// Diagnostics: for each block candidate, report the first gate it fails so we
+// can see *why* a region (e.g. the article body) isn't being translated.
+// Enable by running `localStorage.bitDebug = '1'` in the page console, then
+// translate. Also exposed as `window.__bitDiagnose()` for an on-demand run.
+function rejectionReason(element, currentSettings) {
+  if (element.closest(EXCLUDED_SELECTOR)) return "excluded-selector";
+  if (hasTranslatableAncestor(element)) return "has-translatable-ancestor";
+  const rect = element.getBoundingClientRect();
+  if (rect.width < 24 || rect.height < 8) return "too-small";
+  if (!isElementVisible(element)) return "invisible";
+  const text = getElementText(element);
+  if (text.length > MAX_TRANSLATION_TEXT_LENGTH && !isNaturallyTextBlock(element)) return "too-long";
+  if (currentSettings.translateScope === "viewport" && !isElementInViewport(element)) return "out-of-viewport";
+  if (!isTranslatableBlockText(text)) return "non-translatable-text";
+  if (element.dataset.bitTranslatedText === text) return "already-translated";
+  if (shouldSkipTranslatedText(text, currentSettings)) return "skipped-korean";
+  return null;
+}
+
+function logCollectDiagnostics(currentSettings, passedCount) {
+  const counts = {};
+  const samples = {};
+  const seen = new Set();
+  for (const element of collectBlockCandidates()) {
+    if (seen.has(element)) continue;
+    seen.add(element);
+    const reason = rejectionReason(element, currentSettings) || "PASS";
+    counts[reason] = (counts[reason] || 0) + 1;
+    if (reason !== "PASS" && (samples[reason] = samples[reason] || []).length < 4) {
+      samples[reason].push(element);
+    }
+  }
+  console.log(`[BIT] collect: ${passedCount} translatable / ${seen.size} candidates`, counts);
+  console.log("[BIT] rejected samples (expand to inspect elements)", samples);
+}
+
+if (typeof window !== "undefined") {
+  window.__bitDiagnose = () => logCollectDiagnostics(
+    { ...runtimeState.settings, translateScope: runtimeState.settings.translateScope },
+    -1
+  );
 }
 
 function collectBlockCandidates() {
@@ -2068,8 +2164,10 @@ function markPending(batch) {
     element.classList.add("bit-pending");
     element.classList.remove("bit-failed");
     element.removeAttribute("data-bit-error");
-    const sourceId = element.dataset.bitBlockId;
-    if (sourceId) removeTranslationNodesForSourceId(sourceId);
+    // Keep any existing translation visible until the new one is ready —
+    // renderTranslation swaps it out atomically. Removing it here left the
+    // block blank whenever the run was cancelled (e.g. on scroll) or the
+    // batch failed before the replacement arrived.
   });
 }
 

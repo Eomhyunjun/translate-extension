@@ -96,6 +96,7 @@ const TRANSLATION_ARRAY_RESPONSE_KEYS = Object.freeze([
   "translatedTexts",
   "translated_texts",
   "results",
+  "result",
   "items"
 ]);
 const TRANSLATION_ITEM_RESPONSE_KEYS = Object.freeze([
@@ -489,13 +490,22 @@ function estimateTokens(text) {
 
 async function recordTranslationLog(entry, settings) {
   if (!settings.keepTextLogs) return;
-  logWriteQueue = logWriteQueue.then(async () => {
+  const write = logWriteQueue.then(async () => {
     const stored = await chrome.storage.local.get({ translationLogs: [] });
     const logs = Array.isArray(stored.translationLogs) ? stored.translationLogs : [];
     logs.unshift(entry);
     await chrome.storage.local.set({ translationLogs: logs.slice(0, 100) });
   });
-  await logWriteQueue;
+  // Keep the serialized queue chainable even if this write rejects: a rejected
+  // logWriteQueue would otherwise stay rejected forever, skipping every future
+  // write and making `await` here throw — which would surface a *successful*
+  // translation as a failure. A logging failure must never break translation.
+  logWriteQueue = write.catch(() => {});
+  try {
+    await write;
+  } catch (error) {
+    console.warn("Failed to record translation log", sanitizeError(error));
+  }
 }
 
 function normalizeTexts(texts) {
@@ -584,6 +594,7 @@ const RETRYABLE_HTTP_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 const FETCH_MAX_RETRIES = 2;
 const FETCH_BASE_RETRY_DELAY_MS = 500;
 const FETCH_MAX_RETRY_DELAY_MS = 8000;
+const FETCH_TIMEOUT_MS = 30000;
 
 // Transient provider failures (rate limits, 5xx, dropped connections) recover on a short
 // exponential backoff, so they don't surface as "translation failed". Non-retryable
@@ -592,9 +603,9 @@ async function fetchJsonOrThrow(resource, init, providerLabel) {
   for (let attempt = 0; ; attempt += 1) {
     let response;
     try {
-      response = await fetch(resource, init);
+      response = await fetchWithTimeout(resource, init);
     } catch (error) {
-      if (attempt >= FETCH_MAX_RETRIES) throw error;
+      if (attempt >= FETCH_MAX_RETRIES) throw normalizeFetchError(error, providerLabel);
       await delay(getRetryDelay(attempt, null));
       continue;
     }
@@ -608,6 +619,24 @@ async function fetchJsonOrThrow(resource, init, providerLabel) {
 
     throw new Error(`${providerLabel} request failed: ${response.status}`);
   }
+}
+
+// Without a timeout a hung provider connection never settles, so the request's
+// `isTranslating`/queue state stays stuck (notably the split-view mirror pass) until
+// the MV3 worker is eventually recycled. Abort each attempt after FETCH_TIMEOUT_MS;
+// the abort surfaces as a transient error so the normal retry/backoff handles it.
+function fetchWithTimeout(resource, init) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  return fetch(resource, { ...init, signal: controller.signal })
+    .finally(() => clearTimeout(timer));
+}
+
+function normalizeFetchError(error, providerLabel) {
+  if (error?.name === "AbortError") {
+    return new Error(`${providerLabel} request timed out`);
+  }
+  return error;
 }
 
 function getRetryDelay(attempt, retryAfterHeader) {
