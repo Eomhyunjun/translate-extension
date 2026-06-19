@@ -109,6 +109,7 @@ const MIRROR_TRANSIENT_CLASSES = ["bit-pending", "bit-failed", "bit-replaced"];
 const MIRROR_TRANSIENT_ATTRIBUTES = ["data-bit-error", "data-bit-translated-text", "data-bit-original-text"];
 const MIRROR_CLONE_NODE_ID_ATTRIBUTE = "data-bit-mirror-node-id";
 const TRANSLATION_COUNT_MISMATCH_MESSAGE = "Translation response did not include the expected number of translations.";
+const TRANSLATION_MISSING_MESSAGE = "번역 결과를 받지 못했습니다. (원문이 그대로 반환되었을 수 있어요)";
 const runtimeState = {
   activeRun: 0,
   settings: { ...DEFAULT_SETTINGS },
@@ -121,6 +122,10 @@ const runtimeState = {
   contentObserver: null,
   cleanupHandlers: []
 };
+// In "replace" mode we move the block's original child nodes into a detached fragment and
+// show the translation instead. Keeping the real nodes (not just their textContent) lets us
+// restore links/emphasis/structure exactly when the translation is cleared or re-run.
+const replacedOriginalNodes = new WeakMap();
 const mirrorState = {
   active: false,
   scrollSyncEnabled: true,
@@ -161,13 +166,7 @@ initializeContentScript();
 function initializeContentScript() {
   if (!isExtensionContextAlive()) return;
 
-  chrome.storage.sync.get(Object.keys(DEFAULT_SETTINGS), (stored) => {
-    if (chrome.runtime.lastError || !isExtensionContextAlive()) {
-      disableRuntime();
-      return;
-    }
-    runtimeState.settings = { ...DEFAULT_SETTINGS, ...stored, enabled: false };
-  });
+  const settingsReady = loadInitialSettings();
 
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== "sync" || !runtimeState.contextAlive) return;
@@ -190,7 +189,23 @@ function initializeContentScript() {
   chrome.runtime.onMessage.addListener(handleRuntimeMessage);
   runtimeState.cleanupHandlers.push(() => chrome.runtime.onMessage.removeListener(handleRuntimeMessage));
 
-  maybeReopenSplitMode();
+  maybeReopenSplitMode(settingsReady);
+}
+
+// Resolve once the stored settings have been merged in, so split-view reopen (and anything
+// else that depends on live settings) doesn't race the async storage read on page load.
+function loadInitialSettings() {
+  return new Promise((resolve) => {
+    chrome.storage.sync.get(Object.keys(DEFAULT_SETTINGS), (stored) => {
+      if (chrome.runtime.lastError || !isExtensionContextAlive()) {
+        disableRuntime();
+        resolve();
+        return;
+      }
+      runtimeState.settings = { ...DEFAULT_SETTINGS, ...stored, enabled: false };
+      resolve();
+    });
+  });
 }
 
 function addDomListener(target, type, listener, options) {
@@ -282,6 +297,7 @@ async function runTranslationBatches(groups, {
   shouldContinue = () => isActiveRun(runId),
   onBatchStart,
   onBatchError,
+  onTranslationMissing,
   errorMessage = "Translation failed",
   applyTranslation
 }) {
@@ -297,6 +313,7 @@ async function runTranslationBatches(groups, {
       shouldContinue,
       onBatchStart,
       onBatchError,
+      onTranslationMissing,
       errorMessage,
       applyTranslation
     });
@@ -315,6 +332,7 @@ async function runTranslationBatches(groups, {
       shouldContinue,
       onBatchStart,
       onBatchError,
+      onTranslationMissing,
       errorMessage,
       applyTranslation
     });
@@ -332,6 +350,7 @@ async function runTranslationBatch(batch, {
   shouldContinue,
   onBatchStart,
   onBatchError,
+  onTranslationMissing,
   errorMessage,
   applyTranslation
 }) {
@@ -352,6 +371,7 @@ async function runTranslationBatch(batch, {
         runId,
         shouldContinue,
         onBatchError,
+        onTranslationMissing,
         errorMessage,
         applyTranslation
       });
@@ -372,6 +392,7 @@ async function runTranslationBatch(batch, {
         runId,
         shouldContinue,
         onBatchError,
+        onTranslationMissing,
         errorMessage,
         applyTranslation
       });
@@ -382,19 +403,29 @@ async function runTranslationBatch(batch, {
   }
 
   let translatedCount = 0;
+  let missingCount = 0;
   translations.forEach((translation, offset) => {
     const group = batch[offset];
-    if (!group || translation == null || !shouldContinue() || !isActiveRun(runId)) return;
+    if (!group || !shouldContinue() || !isActiveRun(runId)) return;
+    // A null translation means the provider couldn't translate this item (e.g. an echoed
+    // source the background nulled, or a per-item REST failure). The block was marked
+    // pending in onBatchStart, so it must be cleared here or it spins forever.
+    if (translation == null) {
+      missingCount += 1;
+      onTranslationMissing?.(group);
+      return;
+    }
     translatedCount += applyTranslation(group, translation);
   });
 
-  return { translatedCount, failedCount: 0, aborted: false };
+  return { translatedCount, failedCount: missingCount, aborted: false };
 }
 
 async function runSingleTranslationFallback(groups, {
   runId,
   shouldContinue,
   onBatchError,
+  onTranslationMissing,
   errorMessage,
   applyTranslation
 }) {
@@ -430,8 +461,14 @@ async function runSingleTranslationFallback(groups, {
       continue;
     }
 
+    if (!isActiveRun(runId)) continue;
+
     const [translation] = translations;
-    if (translation == null || !isActiveRun(runId)) continue;
+    if (translation == null) {
+      failedCount += 1;
+      onTranslationMissing?.(group);
+      continue;
+    }
     translatedCount += applyTranslation(group, translation);
   }
 
@@ -498,6 +535,7 @@ async function translatePage(overrides = {}) {
     runId,
     onBatchStart: (batch) => markPending(batch.flatMap((group) => group.blocks)),
     onBatchError: (batch, message) => markTranslationBatchError(batch, message, { quiet: Boolean(overrides.auto) }),
+    onTranslationMissing: (group) => markTranslationBatchError([group], TRANSLATION_MISSING_MESSAGE, { quiet: Boolean(overrides.auto) }),
     applyTranslation: (group, translation) => {
       group.blocks.forEach((item) => renderTranslation(item.element, translation, runtimeState.settings.displayMode));
       return group.blocks.length;
@@ -712,7 +750,8 @@ function setMirrorScrollSync(enabled) {
   }
 }
 
-async function maybeReopenSplitMode() {
+async function maybeReopenSplitMode(settingsReady) {
+  await settingsReady;
   const response = await sendRuntimeMessage({ type: "GET_SPLIT_REOPEN" }, { optional: true });
   if (!response?.ok || !response.reopen) return;
 
@@ -1205,7 +1244,7 @@ function collectMirrorAnchorUnits(root) {
   const occurrenceByKey = new Map();
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
-      if (!isMirrorAnchorTextNode(node, root)) return NodeFilter.FILTER_REJECT;
+      if (!isMirrorAnchorTextNode(node)) return NodeFilter.FILTER_REJECT;
       return NodeFilter.FILTER_ACCEPT;
     }
   });
@@ -1698,11 +1737,7 @@ function isUsableRect(rect) {
 }
 
 function shouldSkipTranslatedText(text, currentSettings) {
-  return (
-    currentSettings.skipTranslated &&
-    currentSettings.targetLang === "ko" &&
-    looksMostlyKorean(text)
-  );
+  return Boolean(currentSettings.skipTranslated) && looksMostlyTargetLanguage(text, currentSettings.targetLang);
 }
 
 function getTextContainer(element) {
@@ -1962,7 +1997,12 @@ function renderTranslation(element, translation, displayMode) {
 
   if (displayMode === "replace") {
     if (element.classList.contains("bit-replaced")) return;
+    // Keep a text fallback in the DOM (survives a content-script re-injection that drops the
+    // WeakMap) and stash the real nodes so markup can be restored without loss.
     element.dataset.bitOriginalText = element.textContent || "";
+    const originalNodes = document.createDocumentFragment();
+    while (element.firstChild) originalNodes.appendChild(element.firstChild);
+    replacedOriginalNodes.set(element, originalNodes);
     element.classList.add("bit-replaced");
     element.textContent = translation;
     return;
@@ -2108,11 +2148,24 @@ function removeBlockTranslation(element) {
   element.classList.remove("bit-pending", "bit-failed");
   element.removeAttribute("data-bit-error");
   delete element.dataset.bitTranslatedText;
-  if (element.classList.contains("bit-replaced")) {
-    if (element.dataset.bitOriginalText) element.textContent = element.dataset.bitOriginalText;
-    element.classList.remove("bit-replaced");
-    delete element.dataset.bitOriginalText;
+  restoreReplacedElement(element);
+}
+
+// Undo a "replace" render: put the original child nodes back (preferred, lossless) or fall
+// back to the stored text if the nodes are gone (e.g. after a content-script re-injection).
+function restoreReplacedElement(element) {
+  if (!element.classList.contains("bit-replaced")) return;
+
+  const originalNodes = replacedOriginalNodes.get(element);
+  if (originalNodes) {
+    element.textContent = "";
+    element.appendChild(originalNodes);
+    replacedOriginalNodes.delete(element);
+  } else if (element.dataset.bitOriginalText) {
+    element.textContent = element.dataset.bitOriginalText;
   }
+  element.classList.remove("bit-replaced");
+  delete element.dataset.bitOriginalText;
 }
 
 function addMirrorRetranslateButton(block) {
@@ -2207,13 +2260,7 @@ function clearTranslations(options = {}) {
   document.querySelectorAll("[data-bit-translated-text]").forEach((node) => {
     delete node.dataset.bitTranslatedText;
   });
-  document.querySelectorAll(".bit-replaced").forEach((node) => {
-    if (node.dataset.bitOriginalText) {
-      node.textContent = node.dataset.bitOriginalText;
-    }
-    node.classList.remove("bit-replaced");
-    delete node.dataset.bitOriginalText;
-  });
+  document.querySelectorAll(".bit-replaced").forEach(restoreReplacedElement);
 }
 
 function stopMirrorMode() {
@@ -2275,14 +2322,23 @@ function normalizeText(value) {
   return value.replace(/\s+/g, " ").trim();
 }
 
-function looksMostlyKorean(value) {
-  const korean = (value.match(/[\uac00-\ud7af]/g) || []).length;
-  const letters = (value.match(/[A-Za-z\uac00-\ud7af\u3040-\u30ff\u3400-\u9fff]/g) || []).length;
-  return letters > 0 && korean / letters > 0.45;
-}
+// Per-target script ranges used to recognise text that is *already* in the target language so
+// the "skip already-translated" option works for every CJK target, not just Korean. Latin-script
+// targets (en/es/fr/de) share an alphabet and can't be told apart this way, so they're omitted
+// (skip simply does nothing for them, as before for non-Korean).
+const TARGET_LANGUAGE_SCRIPT_PATTERNS = {
+  ko: /[\uac00-\ud7af]/g,
+  ja: /[\u3040-\u30ff\u3400-\u9fff]/g,
+  "zh-CN": /[\u3400-\u9fff]/g,
+  "zh-TW": /[\u3400-\u9fff]/g
+};
 
-function clamp(value, min, max) {
-  return Math.max(min, Math.min(max, value));
+function looksMostlyTargetLanguage(value, targetLang) {
+  const pattern = TARGET_LANGUAGE_SCRIPT_PATTERNS[targetLang];
+  if (!pattern) return false;
+  const targetChars = (value.match(pattern) || []).length;
+  const letters = (value.match(/[A-Za-z\uac00-\ud7af\u3040-\u30ff\u3400-\u9fff]/g) || []).length;
+  return letters > 0 && targetChars / letters > 0.45;
 }
 
 async function sendRuntimeMessage(message, { optional = false } = {}) {

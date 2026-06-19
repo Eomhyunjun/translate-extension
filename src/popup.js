@@ -88,21 +88,7 @@ function fill(settings) {
 }
 
 function syncProviderFields() {
-  const activeProvider = provider.value;
-  let visibleCount = 0;
-
-  document.querySelectorAll(".provider-field").forEach((field) => {
-    const isVisible = field.dataset.providerField === activeProvider;
-    field.hidden = !isVisible;
-    field.setAttribute("aria-hidden", String(!isVisible));
-    field.querySelectorAll("input, select").forEach((control) => {
-      control.disabled = !isVisible;
-    });
-    if (isVisible) visibleCount += 1;
-  });
-
-  providerFields.hidden = visibleCount === 0;
-  providerFields.setAttribute("aria-hidden", String(visibleCount === 0));
+  syncProviderFieldVisibility(provider.value, providerFields, "input, select");
 }
 
 function syncProviderAvailability() {
@@ -238,20 +224,10 @@ async function getActiveTab() {
 }
 
 async function sendTabMessage(tabId, payload) {
-  try {
-    return await chrome.tabs.sendMessage(tabId, payload);
-  } catch (error) {
-    if (!isTransientExtensionError(error)) throw error;
-  }
-
-  await injectContentScript(tabId);
-
-  try {
-    return await chrome.tabs.sendMessage(tabId, payload);
-  } catch (error) {
-    if (isTransientExtensionError(error)) throw new Error(POPUP_MESSAGES.tabScriptUnavailable);
-    throw error;
-  }
+  return sendTabMessageWithInjection(tabId, payload, {
+    inject: injectContentScript,
+    retryFailureMessage: POPUP_MESSAGES.tabScriptUnavailable
+  });
 }
 
 function requireOkResponse(response, fallbackMessage) {
@@ -271,38 +247,12 @@ function setMessage(text) {
   message.textContent = text;
 }
 
-function isTransientExtensionError(error) {
-  const text = error?.message || String(error || "");
-  return (
-    text.includes("Extension context invalidated") ||
-    text.includes("Receiving end does not exist") ||
-    text.includes("message channel closed") ||
-    text.includes("message port closed")
-  );
-}
-
 async function injectContentScript(tabId) {
-  const tab = await chrome.tabs.get(tabId);
-  if (!isSupportedPageUrl(tab?.url)) {
-    throw new Error(POPUP_MESSAGES.pageUnavailable);
-  }
-
   try {
-    await chrome.scripting.insertCSS({
-      target: { tabId },
-      files: ["src/content.css"]
-    });
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ["src/defaults.js", "src/content.js"]
-    });
+    await injectTranslatorContentScript(tabId, { unsupportedUrlMessage: POPUP_MESSAGES.pageUnavailable });
   } catch (error) {
     throw new Error(error?.message || POPUP_MESSAGES.tabScriptUnavailable);
   }
-}
-
-function isSupportedPageUrl(url) {
-  return /^(https?|file):\/\//i.test(String(url || ""));
 }
 
 async function ensureEndpointPermission(nextSettings) {
@@ -310,27 +260,8 @@ async function ensureEndpointPermission(nextSettings) {
 
   const stored = await chrome.storage.sync.get(DEFAULT_SETTINGS);
   const endpoint = stored.openaiEndpoint || DEFAULT_SETTINGS.openaiEndpoint;
-  const url = parseOpenAICompatibleEndpoint(endpoint);
-  if (url.hostname === "api.openai.com") return;
-
-  const origin = `${url.origin}/*`;
-  const hasPermission = await chrome.permissions.contains({ origins: [origin] });
-  if (hasPermission) return;
-
-  const granted = await chrome.permissions.request({ origins: [origin] });
-  if (!granted) {
-    throw new Error(POPUP_MESSAGES.compatibleEndpointDenied);
-  }
-}
-
-function parseOpenAICompatibleEndpoint(value) {
-  try {
-    const url = new URL(value);
-    if (url.protocol !== "https:" || url.username || url.password || !url.pathname.endsWith("/chat/completions")) {
-      throw new Error();
-    }
-    return url;
-  } catch {
-    throw new Error(POPUP_MESSAGES.invalidCompatibleEndpoint);
-  }
+  await ensureOpenAICompatibleEndpointPermission(endpoint, {
+    invalidMessage: POPUP_MESSAGES.invalidCompatibleEndpoint,
+    deniedMessage: POPUP_MESSAGES.compatibleEndpointDenied
+  });
 }

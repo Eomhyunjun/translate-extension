@@ -1,4 +1,4 @@
-importScripts("defaults.js");
+importScripts("defaults.js", "shared.js");
 
 const DEFAULT_SETTINGS = globalThis.BIT_DEFAULT_SETTINGS;
 const SECRET_DEFAULTS = globalThis.BIT_SECRET_DEFAULTS;
@@ -251,47 +251,6 @@ async function getCommandTranslationOptions(viewMode) {
   };
 }
 
-async function sendTabMessageWithInjection(tabId, payload) {
-  try {
-    return await chrome.tabs.sendMessage(tabId, payload);
-  } catch (error) {
-    if (!isTransientExtensionError(error)) throw error;
-  }
-
-  await injectContentScript(tabId);
-  return chrome.tabs.sendMessage(tabId, payload);
-}
-
-async function injectContentScript(tabId) {
-  const tab = await chrome.tabs.get(tabId);
-  if (!isSupportedPageUrl(tab?.url)) {
-    throw new Error("현재 페이지에서 실행할 수 없습니다.");
-  }
-
-  await chrome.scripting.insertCSS({
-    target: { tabId },
-    files: ["src/content.css"]
-  });
-  await chrome.scripting.executeScript({
-    target: { tabId },
-    files: ["src/defaults.js", "src/content.js"]
-  });
-}
-
-function isSupportedPageUrl(url) {
-  return /^(https?|file):\/\//i.test(String(url || ""));
-}
-
-function isTransientExtensionError(error) {
-  const text = error?.message || String(error || "");
-  return (
-    text.includes("Extension context invalidated") ||
-    text.includes("Receiving end does not exist") ||
-    text.includes("message channel closed") ||
-    text.includes("message port closed")
-  );
-}
-
 async function setupActionContextMenu() {
   await removeActionContextMenu();
   await new Promise((resolve, reject) => {
@@ -342,14 +301,6 @@ function normalizeTabId(value) {
   return Number.isInteger(tabId) && tabId >= 0 ? tabId : null;
 }
 
-function isPlainObject(value) {
-  return Boolean(value && typeof value === "object" && !Array.isArray(value));
-}
-
-function clamp(value, min, max) {
-  return Math.max(min, Math.min(max, value));
-}
-
 async function getSettings(overrides = {}) {
   await migrateSecretsToLocal();
   const stored = await chrome.storage.sync.get(Object.keys(DEFAULT_SETTINGS));
@@ -393,7 +344,13 @@ async function translateBatch(texts, options = {}) {
 
   try {
     const result = await translateBatchWithProvider(texts, settings);
-    result.translations = dropEchoedTranslations(result.translations, texts, settings);
+    // Echo detection only makes sense for the LLM providers that can hand the source text
+    // back. Deterministic translators (Google/Microsoft/MyMemory) legitimately leave proper
+    // nouns untranslated, so running it on them would null real results and leave the block
+    // stuck. Skip them.
+    if (ECHO_PRONE_PROVIDERS.has(settings.provider)) {
+      result.translations = dropEchoedTranslations(result.translations, texts, settings);
+    }
     await recordTranslationLog({
       ...requestMeta,
       status: "success",
@@ -549,18 +506,6 @@ function copyAllowedValue(target, source, key, allowedValues) {
   if (allowedValues.has(source[key])) target[key] = source[key];
 }
 
-function isAllowedOpenAICompatibleEndpoint(value) {
-  try {
-    const url = new URL(value);
-    if (url.protocol !== "https:") return false;
-    if (url.username || url.password) return false;
-    if (!url.pathname.endsWith("/chat/completions")) return false;
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function sanitizeError(error) {
   const message = error?.message || "Translation failed";
   return message
@@ -696,7 +641,13 @@ async function translateWithGoogle(texts, settings) {
 }
 
 async function translateWithMyMemory(texts, settings) {
-  const source = settings.sourceLang === "auto" ? "en" : settings.sourceLang;
+  // MyMemory's langpair has no auto-detect; the previous code silently forced "en", so a
+  // Japanese/German page was translated as if it were English. Fail loudly instead and ask
+  // the user to pick the source language explicitly.
+  if (settings.sourceLang === "auto") {
+    throw new Error("MyMemory는 원본 언어 자동 감지를 지원하지 않습니다. 설정에서 원본 언어를 직접 선택하세요.");
+  }
+  const source = settings.sourceLang;
   const target = settings.targetLang;
 
   const results = await Promise.allSettled(texts.map(async (text) => {
@@ -1042,6 +993,8 @@ function buildTranslationPrompt(targetLang, sourceLang, texts) {
 // Non-Latin targets have a distinct script, so a real translation always contains some of
 // it. We use that to recognise an *untranslated echo* (the provider — usually a weak LLM —
 // just handed the source text back).
+const ECHO_PRONE_PROVIDERS = new Set(["zhipu", "gpt", "solar", "openai", "gemini", "claude"]);
+
 const TARGET_SCRIPT_PATTERNS = {
   ko: /[가-힯]/,
   ja: /[぀-ヿ㐀-鿿]/,

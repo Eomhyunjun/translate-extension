@@ -296,7 +296,10 @@ async function translateRawTextBatch(texts, settings) {
     throw new Error(TRANSLATION_COUNT_MISMATCH_MESSAGE);
   }
 
-  return translations.map((translation) => String(translation || ""));
+  // A null item means the provider couldn't translate that chunk (e.g. an echoed source the
+  // background nulled). Keep the original text for that paragraph instead of emitting a blank
+  // line with no indication anything was dropped.
+  return translations.map((translation, index) => (translation == null ? texts[index] : String(translation)));
 }
 
 async function translateRawTextOneByOne(texts, settings) {
@@ -395,21 +398,7 @@ function renderPreview(label, values) {
 }
 
 function syncProviderFields() {
-  const activeProvider = provider.value;
-  let visibleCount = 0;
-
-  document.querySelectorAll(".provider-field").forEach((field) => {
-    const isVisible = field.dataset.providerField === activeProvider;
-    field.hidden = !isVisible;
-    field.setAttribute("aria-hidden", String(!isVisible));
-    field.querySelectorAll("input, select, textarea, button").forEach((control) => {
-      control.disabled = !isVisible;
-    });
-    if (isVisible) visibleCount += 1;
-  });
-
-  providerFields.hidden = visibleCount === 0;
-  providerFields.setAttribute("aria-hidden", String(visibleCount === 0));
+  syncProviderFieldVisibility(provider.value, providerFields, "input, select, textarea, button");
 }
 
 function syncViewModeFields() {
@@ -431,29 +420,10 @@ function toggleBatchHelp() {
 async function ensureEndpointPermission(nextSettings) {
   if (nextSettings.provider !== "openai") return;
 
-  const url = parseOpenAICompatibleEndpoint(nextSettings.openaiEndpoint);
-  if (url.hostname === "api.openai.com") return;
-
-  const origin = `${url.origin}/*`;
-  const hasPermission = await chrome.permissions.contains({ origins: [origin] });
-  if (hasPermission) return;
-
-  const granted = await chrome.permissions.request({ origins: [origin] });
-  if (!granted) {
-    throw new Error(SETTINGS_MESSAGES.compatibleEndpointDenied);
-  }
-}
-
-function parseOpenAICompatibleEndpoint(value) {
-  try {
-    const url = new URL(value);
-    if (url.protocol !== "https:" || url.username || url.password || !url.pathname.endsWith("/chat/completions")) {
-      throw new Error();
-    }
-    return url;
-  } catch {
-    throw new Error(SETTINGS_MESSAGES.invalidCompatibleEndpoint);
-  }
+  await ensureOpenAICompatibleEndpointPermission(nextSettings.openaiEndpoint, {
+    invalidMessage: SETTINGS_MESSAGES.invalidCompatibleEndpoint,
+    deniedMessage: SETTINGS_MESSAGES.compatibleEndpointDenied
+  });
 }
 
 function selectTab(activeTab) {
@@ -500,8 +470,4 @@ async function runAction(action) {
   } catch (error) {
     setMessage(error.message || SETTINGS_MESSAGES.saveFailed);
   }
-}
-
-function clamp(value, min, max) {
-  return Math.max(min, Math.min(max, value));
 }
