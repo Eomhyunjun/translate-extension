@@ -98,6 +98,10 @@ const MAX_TRANSLATION_BATCH_SIZE = 50;
 const MAX_TRANSLATION_TEXT_LENGTH = 3000;
 const FIRST_TRANSLATION_BATCH_SIZE = 2;
 const MIRROR_TRANSLATION_BATCH_SIZE = 2;
+// How many TRANSLATE_BATCH requests stay in flight at once after the warm-up batch.
+// Sending batches concurrently (instead of one-at-a-time) is the main lever for
+// perceived speed, especially for LLM providers where each batch is one slow request.
+const TRANSLATION_BATCH_CONCURRENCY = 4;
 // Split view translates in progressive top-to-bottom passes.
 const MIRROR_TRANSLATION_UNIT_LIMIT = 80;
 const MIRROR_SELECTORS = {
@@ -118,9 +122,19 @@ const runtimeState = {
   autoTranslatePending: false,
   nextBlockId: 1,
   contextAlive: true,
+  // True once an inline translation pass has run on this page. Gates the hover
+  // "번역하기" affordance so the floating button never shows up on pages the user
+  // hasn't translated.
+  translationActivated: false,
   lastViewportSignature: "",
   contentObserver: null,
   cleanupHandlers: []
+};
+// The single floating "번역하기" button reused for every hovered, still-untranslated
+// block (and failed ones), plus the block it currently points at.
+const hoverTranslateState = {
+  button: null,
+  target: null
 };
 // In "replace" mode we move the block's original child nodes into a detached fragment and
 // show the translation instead. Keeping the real nodes (not just their textContent) lets us
@@ -185,6 +199,7 @@ function initializeContentScript() {
   addDomListener(window, "keyup", handlePossibleViewportChange);
   addDomListener(window, "resize", handlePossibleViewportChange, { passive: true });
   addDomListener(document, "click", handleRetranslateClick, true);
+  addDomListener(document, "mouseover", handleHoverTranslateOver, { passive: true });
 
   chrome.runtime.onMessage.addListener(handleRuntimeMessage);
   runtimeState.cleanupHandlers.push(() => chrome.runtime.onMessage.removeListener(handleRuntimeMessage));
@@ -324,25 +339,52 @@ async function runTranslationBatches(groups, {
     index = firstBatchSize;
   }
 
+  // Remaining batches run with bounded concurrency: a small pool of workers pulls
+  // from a shared queue so several TRANSLATE_BATCH requests are in flight at once.
+  // Rendering order doesn't matter (each batch applies to its own blocks), so this
+  // only shortens wall-clock time without changing the result.
+  const pending = [];
   for (; index < groups.length; index += batchSize) {
-    if (!shouldContinue()) break;
-
-    const result = await runTranslationBatch(groups.slice(index, index + batchSize), {
-      runId,
-      shouldContinue,
-      onBatchStart,
-      onBatchError,
-      onTranslationMissing,
-      errorMessage,
-      applyTranslation
-    });
-
-    translatedCount += result.translatedCount;
-    failedCount += result.failedCount || 0;
-    if (result.aborted) return { translatedCount, failedCount, aborted: true };
+    pending.push(groups.slice(index, index + batchSize));
   }
 
-  return { translatedCount, failedCount, aborted: false };
+  let aborted = false;
+  let cursor = 0;
+  const runWorker = async () => {
+    while (!aborted && shouldContinue()) {
+      const next = cursor;
+      cursor += 1;
+      if (next >= pending.length) return;
+
+      let result;
+      try {
+        result = await runTranslationBatch(pending[next], {
+          runId,
+          shouldContinue,
+          onBatchStart,
+          onBatchError,
+          onTranslationMissing,
+          errorMessage,
+          applyTranslation
+        });
+      } catch (error) {
+        // A fatal error (e.g. missing key, 401/403) rejects the whole run. Flag aborted
+        // first so sibling workers stop pulling new batches instead of firing more doomed
+        // requests, then rethrow to preserve the original fail-fast contract.
+        aborted = true;
+        throw error;
+      }
+
+      translatedCount += result.translatedCount;
+      failedCount += result.failedCount || 0;
+      if (result.aborted) aborted = true;
+    }
+  };
+
+  const workerCount = Math.min(TRANSLATION_BATCH_CONCURRENCY, pending.length);
+  await Promise.all(Array.from({ length: workerCount }, runWorker));
+
+  return { translatedCount, failedCount, aborted };
 }
 
 async function runTranslationBatch(batch, {
@@ -521,6 +563,8 @@ async function translatePage(overrides = {}) {
 
   const runId = cancelActiveTranslations();
   mergeRuntimeSettings(overrides);
+  runtimeState.translationActivated = Boolean(runtimeState.settings.enabled);
+  if (!runtimeState.translationActivated) hideHoverTranslateButton();
   if (!overrides.auto) {
     persistSplitReopen(false);
     syncAutoMode();
@@ -1423,6 +1467,9 @@ function scheduleAutoTranslate() {
 }
 
 function handlePossibleViewportChange() {
+  // The button is positioned against a block's viewport rect, so any scroll/resize
+  // makes its position stale; drop it and let the next hover re-place it.
+  hideHoverTranslateButton();
   if (mirrorState.active) {
     scheduleMirrorTranslation(MIRROR_TRANSLATION_DELAY_MS.input);
     return;
@@ -1489,7 +1536,7 @@ function isPageContentMutation(mutation) {
 
 function isOwnTranslationNode(node) {
   const element = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
-  return Boolean(element?.closest?.(".bit-translation, .bit-retranslate, .bit-replaced, .bit-mirror-root"));
+  return Boolean(element?.closest?.(".bit-translation, .bit-retranslate, .bit-replaced, .bit-mirror-root, .bit-hover-translate"));
 }
 
 async function translateVisibleIfEnabled() {
@@ -2138,6 +2185,120 @@ async function retranslateBlock(element) {
   if (translatedCount === 0) markFailed([{ element }], "다시 번역했지만 번역 결과를 받지 못했습니다.");
 }
 
+// Hovering a block that was detected but never translated (out of viewport, skipped,
+// or a failed/echoed item) surfaces a floating "번역하기" button anchored to the block's
+// top-right corner. Clicking it translates just that block via the same one-item path as
+// the inline ↻ retry.
+function handleHoverTranslateOver(event) {
+  if (!runtimeState.contextAlive) return;
+  const target = event.target;
+  // Moving onto the button itself must not recompute (which would hide it).
+  if (hoverTranslateState.button && target instanceof Node && hoverTranslateState.button.contains(target)) {
+    return;
+  }
+
+  const block = findHoverTranslatableBlock(target);
+  if (block) {
+    showHoverTranslateButton(block);
+  } else {
+    hideHoverTranslateButton();
+  }
+}
+
+function findHoverTranslatableBlock(node) {
+  if (!runtimeState.translationActivated || mirrorState.active) return null;
+  const start = node instanceof Element ? node : node?.parentElement;
+  if (!start || start.closest(".bit-translation, .bit-hover-translate, .bit-mirror-root")) return null;
+
+  // Walk outward to the canonical translatable unit — the same element collectBlocks
+  // would pick (isTranslatableElement rejects anything with a translatable ancestor).
+  let current = start.closest(BLOCK_SELECTOR);
+  while (current && current !== document.body) {
+    if (isHoverTranslatableBlock(current)) return current;
+    current = current.parentElement?.closest(BLOCK_SELECTOR) || null;
+  }
+  return null;
+}
+
+function isHoverTranslatableBlock(element) {
+  if (element.classList.contains("bit-pending") || element.classList.contains("bit-replaced")) return false;
+  if (!isTranslatableElement(element)) return false;
+
+  const text = getElementText(element);
+  if (!isTranslatableBlockText(text)) return false;
+  if (shouldSkipTranslatedText(text, runtimeState.settings)) return false;
+  if (element.dataset.bitTranslatedText === text) return false;
+
+  // A successful translation node already present → nothing to do. A failed node is
+  // still eligible so the hover button offers another attempt.
+  const blockId = element.dataset.bitBlockId;
+  if (blockId) {
+    const existing = document.querySelector(`.bit-translation[data-bit-source-id="${CSS.escape(blockId)}"]`);
+    if (existing && !existing.classList.contains("bit-translation-failed")) return false;
+  }
+  return true;
+}
+
+function ensureHoverTranslateButton() {
+  if (hoverTranslateState.button) return hoverTranslateState.button;
+
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "bit-hover-translate";
+  button.textContent = "번역하기";
+  button.setAttribute("aria-label", "이 문단 번역하기");
+  button.addEventListener("click", handleHoverTranslateClick);
+  button.addEventListener("mouseleave", hideHoverTranslateButton);
+  document.body.appendChild(button);
+
+  hoverTranslateState.button = button;
+  runtimeState.cleanupHandlers.push(() => {
+    button.remove();
+    hoverTranslateState.button = null;
+    hoverTranslateState.target = null;
+  });
+  return button;
+}
+
+function showHoverTranslateButton(element) {
+  const button = ensureHoverTranslateButton();
+  hoverTranslateState.target = element;
+
+  const rect = element.getBoundingClientRect();
+  button.style.visibility = "hidden";
+  button.style.display = "block";
+  const width = button.offsetWidth;
+  const height = button.offsetHeight;
+  const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
+  const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
+
+  // Straddle the block's top-right corner: the button half-overlaps the block so the
+  // cursor can travel from the block onto the button without crossing a gap (which would
+  // fire mouseover on another element and hide it). It sits on top via z-index.
+  const left = clamp(rect.right - width, 4, Math.max(4, viewportWidth - width - 4));
+  const top = clamp(rect.top - Math.round(height / 2), 4, Math.max(4, viewportHeight - height - 4));
+  button.style.left = `${Math.round(left)}px`;
+  button.style.top = `${Math.round(top)}px`;
+  button.style.visibility = "visible";
+}
+
+function hideHoverTranslateButton() {
+  hoverTranslateState.target = null;
+  if (hoverTranslateState.button) hoverTranslateState.button.style.display = "none";
+}
+
+function handleHoverTranslateClick(event) {
+  event.preventDefault();
+  event.stopPropagation();
+  const element = hoverTranslateState.target;
+  hideHoverTranslateButton();
+  if (!element || !element.isConnected) return;
+
+  retranslateBlock(element).catch((error) => {
+    if (!isContextInvalidatedError(error)) console.warn("Hover translation failed", error);
+  });
+}
+
 function removeBlockTranslation(element) {
   const sourceId = element.dataset.bitBlockId;
   if (sourceId) {
@@ -2250,6 +2411,8 @@ function markFailed(batch, message) {
 }
 
 function clearTranslations(options = {}) {
+  runtimeState.translationActivated = false;
+  hideHoverTranslateButton();
   runtimeState.lastViewportSignature = "";
   if (!options.keepMirror) stopMirrorMode();
   document.querySelectorAll(".bit-translation").forEach((node) => node.remove());
