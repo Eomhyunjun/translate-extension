@@ -9,10 +9,12 @@ The extension is intentionally simple: vanilla JavaScript, no build step, no bun
 ## Features
 
 - Inline bilingual translation for readable page blocks
+- Concurrent batch translation for faster results on long pages and LLM providers
 - Same-tab split translation view with scroll sync
 - Popup controls for provider, model, source language, and target language
 - Options page for full settings, API keys, usage logs, and pasted-text translation
 - Per-paragraph retry when a translation fails
+- Hover `번역하기` (Translate) button on detected-but-untranslated paragraphs (out of viewport, skipped, or failed) to translate just that block on demand
 - Batch fallback for model responses that return malformed or mismatched output
 - URL, domain, and email-like standalone text skipping
 - Inline sentence grouping for text split across sibling tags
