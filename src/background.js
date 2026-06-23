@@ -93,6 +93,7 @@ const CLAUDE_SYSTEM_INSTRUCTION = buildTranslationInstruction(
 );
 const TRANSLATION_ARRAY_RESPONSE_KEYS = Object.freeze([
   "translations",
+  "translated",
   "translatedTexts",
   "translated_texts",
   "results",
@@ -108,6 +109,11 @@ const TRANSLATION_ITEM_RESPONSE_KEYS = Object.freeze([
 ]);
 const MAX_TRANSLATION_BATCH_SIZE = 50;
 const MAX_TRANSLATION_TEXT_LENGTH = 3000;
+// Some OpenAI-compatible providers (e.g. Upstage Solar) default to a tiny
+// max_tokens when the caller omits one, truncating the JSON mid-string and making
+// the response unparseable. Pin it to a large ceiling so output is never cut off;
+// providers clamp this down to their own model limit when it is smaller.
+const OPENAI_COMPATIBLE_MAX_TOKENS = 16384;
 
 chrome.runtime.onInstalled.addListener(async () => {
   const stored = await chrome.storage.sync.get(Object.keys(DEFAULT_SETTINGS));
@@ -715,6 +721,7 @@ function buildOpenAICompatibleRequestBody(texts, settings) {
   const body = {
     model: settings.openaiModel,
     temperature: 0.1,
+    max_tokens: OPENAI_COMPATIBLE_MAX_TOKENS,
     messages: [
       {
         role: "system",
